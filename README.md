@@ -1,6 +1,4 @@
-WHAT ARE U DOING HERE, CLOSE THE REPOSITORY!!!! 😡😡
-
-Source Code & Analysis
+## WHAT ARE U DOING HERE, CLOSE THE REPOSITORY!!!! 😡😡
 ## ⚠️ DISCLAIMER & LEGAL NOTICE
 > **IMPORTANT:** This repository is for educational purposes, security research... The code contained here is a proof-of-concept (PoC) designed to help understand specific malware behaviors and develop countermeasures.
 >
