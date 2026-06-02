@@ -8,9 +8,6 @@
 #include <openssl/crypto.h> /* Required for OPENSSL_cleanse */
 #include <limits.h>
 
-/* =========================================================
- * Constants
- * ========================================================= */
 #define AES_256_KEY_SIZE    32
 #define AES_BLOCK_SIZE      16
 #define MAX_PATH_LEN        512
