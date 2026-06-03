@@ -20,9 +20,6 @@ void handle_errors(const char *msg) {
     abort();
 }
 
-/* =========================================================
- * File Utility Functions
- * ========================================================= */
 int file_exists(const char *filename) {
     struct stat buffer;
     return (stat(filename, &buffer) == 0);
@@ -35,9 +32,6 @@ int is_regular_file(const char *path) {
     return S_ISREG(statbuf.st_mode);
 }
 
-/* =========================================================
- * Secure phrase verification using EVP SHA-256 (OpenSSL 3.0+)
- * ========================================================= */
 int verify_phrase(const char *input) {
     const unsigned char expected_hash[SHA256_DIGEST_LEN] = {
         0x9f, 0x4e, 0x2a, 0x1b, 0x8c, 0x3d, 0x7e, 0x5f,
@@ -50,7 +44,6 @@ int verify_phrase(const char *input) {
     unsigned int hash_len = 0;
     int success = 0;
 
-    /* Use modern EVP API instead of deprecated SHA256() */
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     if (!mdctx) {
         fprintf(stderr, "[ERROR] Failed to create digest context\n");
@@ -66,22 +59,18 @@ int verify_phrase(const char *input) {
     }
     EVP_MD_CTX_free(mdctx);
 
-    /* Constant time comparison to prevent timing side-channel attacks */
     int diff = 0;
     for (int i = 0; i < SHA256_DIGEST_LEN; i++) {
         diff |= (input_hash[i] ^ expected_hash[i]);
     }
     success = (diff == 0);
 
-    /* Clean up temporary hash memory */
     OPENSSL_cleanse(input_hash, sizeof(input_hash));
 
     return success;
 }
 
-/* =========================================================
- * Dynamic File List Management
- * ========================================================= */
+
 typedef struct {
     char **names;
     int    count;
