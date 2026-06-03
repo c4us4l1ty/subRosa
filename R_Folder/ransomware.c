@@ -5,7 +5,7 @@
 #include <sys/stat.h>
 #include <openssl/evp.h>
 #include <openssl/err.h>
-#include <openssl/crypto.h> /* Required for OPENSSL_cleanse */
+#include <openssl/crypto.h>
 #include <limits.h>
 
 #define AES_256_KEY_SIZE    32
@@ -14,9 +14,6 @@
 #define MAX_PHRASE_LEN      256
 #define SHA256_DIGEST_LEN   32
 
-/* =========================================================
- * Error Handling
- * ========================================================= */
 void handle_errors(const char *msg) {
     fprintf(stderr, "[ERROR] %s\n", msg);
     ERR_print_errors_fp(stderr);
