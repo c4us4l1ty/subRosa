@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# battery-dimmer.sh — Ultra-optimized, true zero-fork battery-aware backlight dimmer.
+# battery-dimmer.sh — Ultra-optimized, zero-fork polling battery-aware backlight dimmer.
 # Hardened for arbitrary arithmetic injection, race conditions, and sysfs quirks.
 
 # ==============================================================================
@@ -64,8 +64,9 @@ chmod 700 "$STATE_DIR"
 # Lock — Read/Write mode (<>) prevents truncation race condition.
 exec 9<> "$LOCK_FILE"
 flock -n 9 || { echo "Already running." >&2; exit 1; }
-# Safe truncation AFTER acquiring lock
-truncate -s 0 "$LOCK_FILE"
+
+# Safe zero-fork truncation AFTER acquiring lock
+: > "$LOCK_FILE"
 echo $$ >&9
 
 # Persistent sleep FIFO (Nuke regular files, ensure it is a pipe)
@@ -91,7 +92,8 @@ log_msg() {
     local msg
     # ${1:-} satisfies set -u if called without arguments
     printf -v msg '%(%Y-%m-%d %H:%M:%S)T battery-dimmer: %s\n' -1 "${1:-}"
-    # Atomic append, resilient to full disks / logrotate
+    # Atomic append. Because we open/close per write, this naturally survives 
+    # standard logrotate moves without needing a SIGHUP reopen handler.
     printf '%s' "$msg" >> "$LOG_FILE" 2>/dev/null || printf '%s' "$msg" >> "${STATE_DIR:?}/dimmer.log" 2>/dev/null
 }
 
@@ -107,19 +109,18 @@ log_throttled() {
 # SYSFS HELPERS (BULLETPROOF ZERO-FORK)
 # ==============================================================================
 sysfs_read_int() {
-    # _sri prefixed to prevent nameref collisions with calling scope
-    local -n _sri_out=$2
     local _sri_raw=""
     
     # || true prevents script crash on missing newline, still populates _sri_raw
     read -r _sri_raw < "$1" 2>/dev/null || true
     
-    # +([0-9-]) supports potential negative error codes (e.g., -1) returned by broken drivers
-    if [[ -n "$_sri_raw" && "$_sri_raw" == +([0-9-]) ]]; then
-        _sri_out=$_sri_raw
+    # Strict regex: optional leading hyphen, followed by 1 or more digits.
+    # Prevents arithmetic crashes from broken drivers returning "---" or "1-2".
+    if [[ -n "$_sri_raw" && "$_sri_raw" =~ ^-?[0-9]+$ ]]; then
+        printf -v "$2" '%s' "$_sri_raw" # Zero-fork safe assignment
         return 0
     fi
-    _sri_out=0
+    printf -v "$2" '%s' "0"
     return 1
 }
 
@@ -130,6 +131,7 @@ sysfs_write_int() {
 
 state_persist() {
     local name=$1 val=$2 tmp="${STATE_DIR:?}/.$name.$$"
+    # Note: mv is an external binary, but required here for atomic disk persistence
     printf '%s\n' "$val" > "$tmp" 2>/dev/null && mv -f "$tmp" "${STATE_DIR}/$name" 2>/dev/null
 }
 
@@ -160,7 +162,7 @@ scan_backlights() {
             if sysfs_read_int "$STATE_DIR/$name" saved && (( saved > 0 && saved <= max_bright )); then
                 BL_ORIG[$bl]=$saved
                 target=$(( saved - (saved * DIM_BY_PERCENT + 99) / 100 ))
-                (( target < BL_MIN[$bl] )) && target=${BL_MIN[$bl]}
+                (( target < ${BL_MIN[$bl]} )) && target=${BL_MIN[$bl]}
                 sysfs_write_int "$bl/brightness" "$target" && \
                     log_msg "Recovered $name to ${target}/${max_bright}."
             fi
@@ -214,7 +216,8 @@ update_telemetry() {
 
         [[ "${PS_SCOPE[i]}" == "device" ]] && continue
 
-        [[ -f "$dev/status" ]] && read -r status < "$dev/status" 2>/dev/null || status=""
+        status=""
+        [[ -f "$dev/status" ]] && read -r status < "$dev/status" 2>/dev/null
         case "${status,,}" in
             discharging) any_discharging=1 ;;
             charging|full|"not charging") any_charging=1 ;;
@@ -254,7 +257,9 @@ update_telemetry() {
 # ACTIONS
 # ==============================================================================
 apply_dim() {
-    local bl name current target orig_saved diff reduction
+    (( ${#BACKLIGHTS[@]} == 0 )) && return 0
+    local bl name current target orig_saved diff reduction orig_diff
+
     for bl in "${BACKLIGHTS[@]}"; do
         name="${bl##*/}"
         [[ ${BL_OVERRIDE[$name]:-0} == 1 ]] && continue
@@ -265,7 +270,7 @@ apply_dim() {
             reduction=$(( (current * DIM_BY_PERCENT + 99) / 100 ))
             (( reduction < 1 )) && reduction=1
             target=$(( current - reduction ))
-            (( target < BL_MIN[$bl] )) && target=${BL_MIN[$bl]}
+            (( target < ${BL_MIN[$bl]} )) && target=${BL_MIN[$bl]}
 
             if (( current > target )); then
                 BL_ORIG[$bl]=$current
@@ -281,17 +286,32 @@ apply_dim() {
             orig_saved=${BL_ORIG[$bl]}
             reduction=$(( (orig_saved * DIM_BY_PERCENT + 99) / 100 ))
             target=$(( orig_saved - reduction ))
-            (( target < BL_MIN[$bl] )) && target=${BL_MIN[$bl]}
+            (( target < ${BL_MIN[$bl]} )) && target=${BL_MIN[$bl]}
             
             diff=$(( current - target ))
             (( diff < 0 )) && diff=$(( -diff ))
 
-            # If suspend occurred, IGNORE tolerance check, because random 
-            # kernel brightness changes on wake are not user overrides.
             if (( SUSPEND_OCCURRED == 1 )); then
-                sysfs_write_int "$bl/brightness" "$target" && \
-                    log_msg "Suspend/resume detected. Re-applied dim on $name."
-            elif (( diff > BL_TOL[$bl] )); then
+                if (( diff <= ${BL_TOL[$bl]} )); then
+                    : # Already at target, do nothing
+                else
+                    orig_diff=$(( current - orig_saved ))
+                    (( orig_diff < 0 )) && orig_diff=$(( -orig_diff ))
+                    
+                    if (( orig_diff <= ${BL_TOL[$bl]} )); then
+                        # DE restored to original on wake, re-apply dim
+                        sysfs_write_int "$bl/brightness" "$target" && \
+                            log_msg "Suspend/resume: DE restored $name, re-applying dim."
+                    else
+                        # Wildly different, assume user/DE override
+                        unset 'BL_ORIG[$bl]'
+                        BL_OVERRIDE[$name]=1
+                        rm -f "${STATE_DIR:?}/$name"
+                        log_throttled "$name" "Suspend/resume: Override detected on $name. Released control."
+                    fi
+                fi
+            elif (( diff > ${BL_TOL[$bl]} )); then
+                # Normal runtime manual override
                 unset 'BL_ORIG[$bl]'
                 BL_OVERRIDE[$name]=1
                 rm -f "${STATE_DIR:?}/$name"
@@ -302,7 +322,9 @@ apply_dim() {
 }
 
 apply_restore() {
+    (( ${#BACKLIGHTS[@]} == 0 )) && return 0
     local bl name current orig_saved dimmed_set diff reduction
+
     for bl in "${BACKLIGHTS[@]}"; do
         name="${bl##*/}"
 
@@ -312,13 +334,13 @@ apply_restore() {
 
             reduction=$(( (orig_saved * DIM_BY_PERCENT + 99) / 100 ))
             dimmed_set=$(( orig_saved - reduction ))
-            (( dimmed_set < BL_MIN[$bl] )) && dimmed_set=${BL_MIN[$bl]}
+            (( dimmed_set < ${BL_MIN[$bl]} )) && dimmed_set=${BL_MIN[$bl]}
             
             diff=$(( current - dimmed_set ))
             (( diff < 0 )) && diff=$(( -diff ))
 
             # Even on wake up, if we plug in power, we want to restore.
-            if (( diff <= BL_TOL[$bl] || SUSPEND_OCCURRED == 1 )); then
+            if (( diff <= ${BL_TOL[$bl]} || SUSPEND_OCCURRED == 1 )); then
                 sysfs_write_int "$bl/brightness" "$orig_saved" && \
                     log_msg "Restored $name to original ($orig_saved)."
             fi
@@ -336,26 +358,34 @@ apply_restore() {
 # CLEANUP
 # ==============================================================================
 cleanup() {
-    trap '' EXIT SIGINT SIGTERM SIGHUP SIGQUIT # Prevent re-entrancy
+    # SIGHUP removed to allow logrotate to function without killing the daemon
+    trap '' EXIT SIGINT SIGTERM SIGQUIT 
     (( CLEANING_UP )) && exit 0
     CLEANING_UP=1
 
     log_msg "Stopping. Restoring backlights..."
-    local bl val
-    for bl in "${BACKLIGHTS[@]:-}"; do
-        val=${BL_ORIG[$bl]:-}
-        [[ -n "$val" ]] && sysfs_write_int "$bl/brightness" "$val"
-    done
+    
+    # Prevent unbound variable error on empty array under set -u
+    if (( ${#BACKLIGHTS[@]} > 0 )); then
+        for bl in "${BACKLIGHTS[@]}"; do
+            val=${BL_ORIG[$bl]:-}
+            [[ -n "$val" ]] && sysfs_write_int "$bl/brightness" "$val"
+        done
+    fi
 
+    # CRITICAL: Delete state BEFORE releasing the lock to prevent race conditions
+    # where a newly spawned instance acquires the lock while we are deleting its state.
+    rm -rf "${STATE_DIR:?}"
+    rm -f "$LOCK_FILE"
+
+    # Now release FDs
     exec 8<&- 2>/dev/null
     exec 9>&- 2>/dev/null
     
-    # ${STATE_DIR:?} guarantees we never accidentally rm -rf /
-    rm -rf "${STATE_DIR:?}" "$LOCK_FILE"
     exit 0
 }
 
-trap cleanup EXIT SIGINT SIGTERM SIGHUP SIGQUIT
+trap cleanup EXIT SIGINT SIGTERM SIGQUIT
 
 # ==============================================================================
 # MAIN LOOP
