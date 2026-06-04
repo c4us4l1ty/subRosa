@@ -1,8 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-# CONFIGURATION
+# CONFIGURATION & ENVIRONMENT
 # ==============================================================================
+# Force POSIX locale to prevent awk/journalctl localization bugs (e.g., comma decimals)
+export LC_ALL=C
+
 THRESHOLD=50       # Battery percentage to trigger dimming
 DIM_BY_PERCENT=30  # Reduce current brightness by this percentage
 MIN_PERCENT=5      # Safety: Never let brightness drop below this % of max
@@ -225,12 +228,43 @@ trap cleanup EXIT SIGINT SIGTERM SIGHUP
 # ==============================================================================
 logger -t battery-dimmer "Service started. Threshold: ${THRESHOLD}%, Dim: ${DIM_BY_PERCENT}%"
 
+# Initialize temporal tracking for native suspend detection
+if [[ -v EPOCHREALTIME ]]; then
+    last_tick=${EPOCHREALTIME%.*}
+else
+    last_tick=$(date +%s)
+fi
+
 while true; do
+    # Calculate elapsed time to detect suspend/resume natively
+    if [[ -v EPOCHREALTIME ]]; then
+        current_tick=${EPOCHREALTIME%.*}
+    else
+        current_tick=$(date +%s)
+    fi
+    
+    elapsed=$(( current_tick - last_tick ))
+    
+    # If the loop took significantly longer than the sleep time, the system was asleep.
+    # This replaces brittle journalctl string-matching and avoids non-systemd dependencies.
+    if [ "$elapsed" -gt 15 ]; then
+        SUSPEND_OCCURRED=1
+    else
+        SUSPEND_OCCURRED=0
+    fi
+    last_tick=$current_tick
+
     BAT_PERCENT=$(get_global_battery_percent)
     STATE=$(get_global_power_state)
 
     if [ "$BAT_PERCENT" = "ERROR" ]; then
         sleep 15
+        # Update last_tick so the long sleep doesn't trigger a false suspend detection next loop
+        if [[ -v EPOCHREALTIME ]]; then
+            last_tick=${EPOCHREALTIME%.*}
+        else
+            last_tick=$(date +%s)
+        fi
         continue
     fi
 
@@ -250,7 +284,10 @@ while true; do
 
             CURRENT_BRIGHTNESS=$(read_sysfs_int "$bl/brightness")
             MAX_BRIGHTNESS=$(read_sysfs_int "$bl/max_brightness")
+            
+            # Calculate minimum brightness with a safety floor of 1 to prevent "black screen" on low-scale backlights
             MIN_BRIGHTNESS=$(( MAX_BRIGHTNESS * MIN_PERCENT / 100 ))
+            [ "$MIN_BRIGHTNESS" -le 0 ] && MIN_BRIGHTNESS=1
 
             if [ ! -f "$state_file" ]; then
                 # FIRST TIME DIMMING: Save original and dim
@@ -270,8 +307,8 @@ while true; do
 
                 if ! is_within_tolerance "$CURRENT_BRIGHTNESS" "$TARGET_BRIGHTNESS" "$MAX_BRIGHTNESS"; then
                     if [ "$CURRENT_BRIGHTNESS" -eq "$MAX_BRIGHTNESS" ]; then
-                        # Check if the kernel actually just woke from suspend in the last 15 seconds
-                        if journalctl -k --since "15 seconds ago" 2>/dev/null | grep -qiE "ACPI: PM: Waking up|Suspended|suspend entry|PM: suspend"; then
+                        # Use our native math-based suspend detection instead of brittle journalctl regex
+                        if [ "$SUSPEND_OCCURRED" -eq 1 ]; then
                             logger -t battery-dimmer "Suspend/Resume detected on $bl_name. Re-applying dim."
                             echo "$TARGET_BRIGHTNESS" > "$bl/brightness" 2>/dev/null
                         else
@@ -306,7 +343,10 @@ while true; do
                 
                 # Calculate what the dimmed value *was* to check if user overrode it
                 DIMMED_SET=$(( ORIGINAL_SAVED - (ORIGINAL_SAVED * DIM_BY_PERCENT / 100) ))
+                
+                # Calculate minimum brightness with a safety floor of 1
                 MIN_BRIGHTNESS=$(( MAX_BRIGHTNESS * MIN_PERCENT / 100 ))
+                [ "$MIN_BRIGHTNESS" -le 0 ] && MIN_BRIGHTNESS=1
                 [ "$DIMMED_SET" -lt "$MIN_BRIGHTNESS" ] && DIMMED_SET=$MIN_BRIGHTNESS
 
                 if is_within_tolerance "$CURRENT_BRIGHTNESS" "$DIMMED_SET" "$MAX_BRIGHTNESS"; then
