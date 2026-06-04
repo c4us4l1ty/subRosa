@@ -121,11 +121,11 @@ get_global_battery_percent() {
 get_global_power_state() {
     local type_val status_val
 
-    # 1. Check AC Adapters and USB-C PD
+    # 1. Check AC Adapters first
     for ac in /sys/class/power_supply/*; do
         if [ -f "$ac/type" ]; then
             read -r type_val 2>/dev/null < "$ac/type"
-            type_val="${type_val,,}" # Convert to lowercase natively
+            type_val="${type_val,,}"
             if [[ "$type_val" == *"mains"* || "$type_val" == *"usb"* ]]; then
                 if [ "$(read_sysfs_int "$ac/online")" -eq 1 ]; then
                     echo "charging"
@@ -135,23 +135,23 @@ get_global_power_state() {
         fi
     done
     
-    # 2. Fallback: Check battery statuses (Handles Conservation Modes)
+    # 2. Check batteries for ANY "discharging" state
     for bat in /sys/class/power_supply/*; do
         if [ -f "$bat/type" ] && [ -f "$bat/status" ]; then
             read -r type_val 2>/dev/null < "$bat/type"
             if [[ "${type_val,,}" == *"battery"* ]]; then
                 read -r status_val 2>/dev/null < "$bat/status"
-                status_val="${status_val,,}"
-                # Added "Unknown" to handle certain ACPI drivers when fully charged
-                if [[ "$status_val" == *"charging"* || "$status_val" == *"full"* || "$status_val" == *"not charging"* || "$status_val" == *"unknown"* ]]; then
-                    echo "charging"
+                # Exact match for discharging only to prevent "discharging" matching *"charging"*
+                if [[ "${status_val,,}" == "discharging" ]]; then
+                    echo "discharging"
                     return
                 fi
             fi
         fi
     done
 
-    echo "discharging"
+    # Default to charging if AC is not online and no battery is actively discharging
+    echo "charging"
 }
 
 get_valid_backlights() {
