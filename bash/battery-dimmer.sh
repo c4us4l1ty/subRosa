@@ -246,8 +246,8 @@ while true; do
     elapsed=$(( current_tick - last_tick ))
     
     # If the loop took significantly longer than the sleep time, the system was asleep.
-    # This replaces brittle journalctl string-matching and avoids non-systemd dependencies.
-    if [ "$elapsed" -gt 15 ]; then
+    # A 30-second threshold (3x the 10s sleep) provides a 3-sigma buffer against OS-level I/O stalls.
+    if [ "$elapsed" -gt 30 ]; then
         SUSPEND_OCCURRED=1
     else
         SUSPEND_OCCURRED=0
@@ -258,7 +258,10 @@ while true; do
     STATE=$(get_global_power_state)
 
     if [ "$BAT_PERCENT" = "ERROR" ]; then
-        sleep 15
+        # Interruptible sleep: Background the process and wait on its PID.
+        # This allows trapped signals (SIGTERM) to instantly break the wait.
+        sleep 15 & wait $!
+        
         # Update last_tick so the long sleep doesn't trigger a false suspend detection next loop
         if [[ -v EPOCHREALTIME ]]; then
             last_tick=${EPOCHREALTIME%.*}
@@ -369,5 +372,7 @@ while true; do
         done
     fi
 
-    sleep 10
+    # Interruptible sleep: Background the process and wait on its PID.
+    # Allows instant trap execution on SIGTERM during system shutdown.
+    sleep 10 & wait $!
 done
