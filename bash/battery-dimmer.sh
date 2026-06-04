@@ -1,172 +1,102 @@
 #!/usr/bin/env bash
 #
-# battery-dimmer.sh — Production-grade battery-aware backlight dimmer.
-#
-# Features
-#   • Zero-fork steady-state hot path
-#   • FD-cached sysfs reads (one open at init, persistent FDs)
-#   • Crash-safe state persistence (atomic write via mktemp+rename)
-#   • Suspend/resume detection (SECONDS drift heuristic)
-#   • User override detection (manual brightness changes release control)
-#   • Multi-backlight and multi-battery support
-#   • Periodic hardware re-scan for hotplug resilience
-#   • Trap-recursion guard
-#   • Strict-mode friendly (set -uo pipefail)
-#
-# Requirements
-#   Bash 4.3+ (for printf '%(...)T' and local -n)
-#   Linux with /sys/class/backlight and /sys/class/power_supply
-#   Root privileges (writes to /sys/class/backlight/*/brightness)
-#
-# Suggested logrotate fragment
-#   /var/log/battery-dimmer.log {
-#       daily, rotate 7, compress, missingok, notifempty
-#   }
-#
+# battery-dimmer.sh — Ultra-optimized, true zero-fork battery-aware backlight dimmer.
+# Hardened for arbitrary arithmetic injection, race conditions, and sysfs quirks.
 
 # ==============================================================================
-# STRICT MODE
+# STRICT MODE & PARSER SETTINGS
 # ==============================================================================
-# -u  : catch unset-variable bugs (we use ${var:-default} where needed)
-# -o pipefail : propagate pipe failures
-# NOT -e : we explicitly want to survive a single broken backlight / battery
 set -uo pipefail
+shopt -s nullglob extglob
+
+# Bash 4.2+ required for printf %()T (Zero-fork timestamps)
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
+    echo "Error: Bash 4.2 or higher is required." >&2
+    exit 1
+fi
 
 # ==============================================================================
-# CONFIGURATION
+# CONFIGURATION & INJECTION PREVENTION
 # ==============================================================================
-readonly THRESHOLD=${THRESHOLD:-50}             # % battery below which we dim
-readonly DIM_BY_PERCENT=${DIM_BY_PERCENT:-30}    # % reduction from original
-readonly MIN_PERCENT=${MIN_PERCENT:-5}           # floor: never below this %
-readonly SUSPEND_THRESHOLD=${SUSPEND_THRESHOLD:-15}
-readonly POLL_INTERVAL=${POLL_INTERVAL:-10}
-readonly LOG_THROTTLE=${LOG_THROTTLE:-30}
-readonly RESCAN_EVERY=${RESCAN_EVERY:-100}       # polls between hw re-scans
-readonly RECOVERY_SETTLE=${RECOVERY_SETTLE:-2}   # s grace for sysfs post-resume
+# Fallbacks
+: "${THRESHOLD:=50}"
+: "${DIM_BY_PERCENT:=30}"
+: "${MIN_PERCENT:=5}"
+: "${SUSPEND_THRESHOLD:=10}"
+: "${POLL_INTERVAL:=10}"
+: "${LOG_THROTTLE:=30}"
+: "${RESCAN_EVERY:=100}"
+: "${RECOVERY_SETTLE:=2}"
 
-# Validate configuration early — fail fast on nonsense
-(( THRESHOLD >= 0 && THRESHOLD <= 100 ))   || { echo "THRESHOLD out of range" >&2; exit 1; }
-(( DIM_BY_PERCENT > 0 && DIM_BY_PERCENT <= 100 )) || { echo "DIM_BY_PERCENT out of range" >&2; exit 1; }
-(( MIN_PERCENT >= 0 && MIN_PERCENT < 100 )) || { echo "MIN_PERCENT out of range" >&2; exit 1; }
-(( POLL_INTERVAL >= 1 ))                   || { echo "POLL_INTERVAL must be >= 1" >&2; exit 1; }
-(( SUSPEND_THRESHOLD > POLL_INTERVAL ))    || { echo "SUSPEND_THRESHOLD must exceed POLL_INTERVAL" >&2; exit 1; }
+# STRICT NUMERIC VALIDATION (Prevents arithmetic execution injection)
+for _var in THRESHOLD DIM_BY_PERCENT MIN_PERCENT SUSPEND_THRESHOLD POLL_INTERVAL LOG_THROTTLE RESCAN_EVERY RECOVERY_SETTLE; do
+    [[ "${!_var}" =~ ^[0-9]+$ ]] || { echo "Fatal: $_var must be a positive integer." >&2; exit 1; }
+done
+unset _var
+
+readonly THRESHOLD DIM_BY_PERCENT MIN_PERCENT SUSPEND_THRESHOLD POLL_INTERVAL LOG_THROTTLE RESCAN_EVERY RECOVERY_SETTLE
+
+(( THRESHOLD >= 0 && THRESHOLD <= 100 ))          || exit 1
+(( DIM_BY_PERCENT > 0 && DIM_BY_PERCENT <= 100 )) || exit 1
+(( MIN_PERCENT >= 0 && MIN_PERCENT < 100 ))       || exit 1
+(( POLL_INTERVAL >= 1 ))                          || exit 1
+(( SUSPEND_THRESHOLD > 2 ))                       || exit 1
 
 # ==============================================================================
-# PATHS
+# PATHS & ROBUST INITIALIZATION
 # ==============================================================================
 readonly SYSFS_BL="/sys/class/backlight"
 readonly SYSFS_PS="/sys/class/power_supply"
 readonly STATE_DIR="/run/battery-dimmer"
-readonly LOCK_FILE="$STATE_DIR/lock"
+readonly LOCK_FILE="/run/battery-dimmer.pid"
 readonly LOG_FILE="/var/log/battery-dimmer.log"
 readonly SLEEP_FIFO="$STATE_DIR/.sleep_fifo"
 
-# ==============================================================================
-# PREFLIGHT
-# ==============================================================================
 export LC_ALL=C
 
-# Bash version
-if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
-    echo "Error: Bash 4.3+ required (have ${BASH_VERSION:-unknown})." >&2
-    exit 1
-fi
+# Root check
+(( EUID == 0 )) || { echo "Root required." >&2; exit 1; }
 
-# Root
-if (( EUID != 0 )); then
-    echo "Error: Must run as root." >&2
-    exit 1
-fi
-
-shopt -s nullglob
-
-# State dir
-if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
-    echo "Error: Cannot create $STATE_DIR." >&2
-    exit 1
-fi
+# State dir (ensure it exists before locking)
+mkdir -p "$STATE_DIR" 2>/dev/null
 chmod 700 "$STATE_DIR"
 
-# Lock — non-blocking, fail fast if another instance is running
-exec 9> "$LOCK_FILE"
-if ! flock -n 9; then
-    echo "Error: Service already running (lock: $LOCK_FILE)." >&2
-    exit 1
-fi
+# Lock — Read/Write mode (<>) prevents truncation race condition.
+exec 9<> "$LOCK_FILE"
+flock -n 9 || { echo "Already running." >&2; exit 1; }
+# Safe truncation AFTER acquiring lock
+truncate -s 0 "$LOCK_FILE"
+echo $$ >&9
 
-# Persistent log FD
-if ! exec 7>> "$LOG_FILE" 2>/dev/null; then
-    # Fall back to syslog-like path if /var/log is read-only
-    if ! exec 7>> "$STATE_DIR/dimmer.log" 2>/dev/null; then
-        echo "Error: Cannot open any writable log file." >&2
-        exit 1
-    fi
-fi
-
-# Persistent sleep FIFO — opened RW by the same process so open() doesn't block
-if [[ ! -p "$SLEEP_FIFO" ]]; then
-    rm -f "$SLEEP_FIFO" 2>/dev/null
-    if ! mkfifo "$SLEEP_FIFO" 2>/dev/null; then
-        echo "Error: Cannot create sleep FIFO $SLEEP_FIFO." >&2
-        exit 1
-    fi
-    chmod 600 "$SLEEP_FIFO"
-fi
+# Persistent sleep FIFO (Nuke regular files, ensure it is a pipe)
+[[ -p "$SLEEP_FIFO" ]] || { rm -f "$SLEEP_FIFO"; mkfifo -m 600 "$SLEEP_FIFO"; }
 exec 8<> "$SLEEP_FIFO"
 
 # ==============================================================================
 # GLOBALS
 # ==============================================================================
-# Per-backlight caches (keyed by backlight path)
-declare -A BL_MAX=()      # max brightness
-declare -A BL_MIN=()      # floor brightness
-declare -A BL_TOL=()      # tolerance for "did the user touch it?"
-declare -A BL_ORIG=()     # saved original brightness (while dimmed)
-declare -A BL_FD_BR=()    # FD for brightness
-declare -A BL_FD_MAX=()   # FD for max_brightness
-declare -A BL_OVERRIDE=() # 1 = user has released control until power cycle
-declare -A LOG_LAST=()    # last log timestamp per throttling key
+# Associative arrays
+declare -A BL_MAX=() BL_MIN=() BL_TOL=() BL_ORIG=() BL_OVERRIDE=() LOG_LAST=()
 
-# Hardware lists
-declare -a BACKLIGHTS=()
-declare -a POWER_SUPPLIES=()
+# Indexed arrays
+declare -a BACKLIGHTS=() POWER_SUPPLIES=() PS_KIND=() PS_SCOPE=()
 
-# Per-power-supply FDs (parallel arrays, indexed by position)
-declare -a PS_FD_TYPE=()
-declare -a PS_FD_ONLINE=()
-declare -a PS_FD_STATUS=()
-declare -a PS_FD_SCOPE=()
-declare -a PS_FD_NOW=()
-declare -a PS_FD_FULL=()
-declare -a PS_FD_CAP=()
-declare -a PS_KIND=()    # "mains" | "usb" | "battery" — parallel index
-declare -a PS_NAME=()    # basename for logging — parallel index
-
-# Telemetry snapshot
-declare BATTERY_PCT=100
-declare SHOULD_DIM=0     # single source of truth for "should we dim?"
-declare POWER_INPUT=0    # 1 = any mains/usb online
-
-# Loop control
-declare CLEANING_UP=0
-declare POLL_COUNT=0
-declare LAST_TICK=$SECONDS
+declare -i BATTERY_PCT=100 SHOULD_DIM=0 POWER_INPUT=0
+declare -i CLEANING_UP=0 POLL_COUNT=0 LAST_TICK=$SECONDS SUSPEND_OCCURRED=0
 
 # ==============================================================================
-# LOGGING
+# ZERO-FORK LOGGING
 # ==============================================================================
-
-# Zero-fork timestamped log. printf -v avoids subshell.
 log_msg() {
     local msg
-    printf -v msg '%(%Y-%m-%d %H:%M:%S)T battery-dimmer: %s\n' -1 "$1"
-    printf '%s' "$msg" >&7
+    # ${1:-} satisfies set -u if called without arguments
+    printf -v msg '%(%Y-%m-%d %H:%M:%S)T battery-dimmer: %s\n' -1 "${1:-}"
+    # Atomic append, resilient to full disks / logrotate
+    printf '%s' "$msg" >> "$LOG_FILE" 2>/dev/null || printf '%s' "$msg" >> "${STATE_DIR:?}/dimmer.log" 2>/dev/null
 }
 
-# Throttled log: only emits if the same key hasn't been logged recently.
 log_throttled() {
-    local key=$1 text=$2
-    local now=$SECONDS last=${LOG_LAST[$key]:-0}
+    local key=$1 text=$2 now=$SECONDS last=${LOG_LAST[$key]:-0}
     if (( now - last >= LOG_THROTTLE )); then
         LOG_LAST[$key]=$now
         log_msg "$text"
@@ -174,305 +104,146 @@ log_throttled() {
 }
 
 # ==============================================================================
-# SYSFS HELPERS
+# SYSFS HELPERS (BULLETPROOF ZERO-FORK)
 # ==============================================================================
-
-# Read an integer from a sysfs file (one-shot, no FD cache).
-#   $1 = path, $2 = nameref to receive the value
-#   Returns 0 if a valid integer was read, 1 otherwise.
-#   On "no data" / parse failure, _out is set to 0 and 1 is returned so the
-#   caller can distinguish "actual zero" from "no reading available".
 sysfs_read_int() {
-    local -n _out=$2
-    local _raw
-    if ! read -r _raw < "$1" 2>/dev/null; then
-        _out=0
-        return 1
+    # _sri prefixed to prevent nameref collisions with calling scope
+    local -n _sri_out=$2
+    local _sri_raw=""
+    
+    # || true prevents script crash on missing newline, still populates _sri_raw
+    read -r _sri_raw < "$1" 2>/dev/null || true
+    
+    # +([0-9-]) supports potential negative error codes (e.g., -1) returned by broken drivers
+    if [[ -n "$_sri_raw" && "$_sri_raw" == +([0-9-]) ]]; then
+        _sri_out=$_sri_raw
+        return 0
     fi
-    if [[ ! "$_raw" =~ ^[0-9]+$ ]]; then
-        _out=0
-        return 1
-    fi
-    _out=$_raw
-    return 0
+    _sri_out=0
+    return 1
 }
 
-# Read an integer from a cached FD.
-#   $1 = FD number, $2 = nameref
-#   Returns 0 on success, 1 on failure (caller decides what to do).
-sysfs_fd_read_int() {
-    local -n _out=$2
-    local _raw
-    if ! read -r _raw <&"$1" 2>/dev/null; then
-        _out=0
-        return 1
-    fi
-    if [[ ! "$_raw" =~ ^[0-9]+$ ]]; then
-        _out=0
-        return 1
-    fi
-    _out=$_raw
-    return 0
-}
-
-# Atomic write of a value to a sysfs file.
-#   $1 = path, $2 = value (integer)
-#   Returns 0 on success.
 sysfs_write_int() {
-    # We deliberately do NOT use a cached FD for writes — many backlight
-    # drivers reject writes that don't come from "the same opener", and
-    # keeping a write FD open across the lifetime of the daemon would
-    # hold an exclusive reference. Open/write/close per write is the
-    # safe and supported pattern.
-    local path=$1 value=$2
-    local tmp
-    tmp=$(mktemp "$STATE_DIR/.write.XXXXXX") || return 1
-    printf '%s\n' "$value" > "$tmp" || { rm -f "$tmp"; return 1; }
-    # mv is atomic on the same filesystem
-    if ! mv -f "$tmp" "$path" 2>/dev/null; then
-        # Fall back: direct write
-        if ! printf '%s\n' "$value" > "$path" 2>/dev/null; then
-            rm -f "$tmp"
-            return 1
-        fi
-        rm -f "$tmp"
-    fi
-    return 0
+    # sysfs writes < PAGE_SIZE are atomic at the kernel level
+    printf '%s\n' "$2" > "$1" 2>/dev/null
 }
 
-# ==============================================================================
-# COMPUTE
-# ==============================================================================
-
-# Compute the dimmed target for a given backlight and original value.
-# Writes the result to a caller-supplied nameref (no subshell).
-#   $1 = original brightness, $2 = backlight path, $3 = nameref for output
-compute_dim_target() {
-    local original=$1 path=$2
-    local -n _target=$3
-    local max=${BL_MAX[$path]:-0}
-    local min=${BL_MIN[$path]:-1}
-    local reduction
-
-    if (( max <= 0 )); then
-        _target=0
-        return
-    fi
-
-    # Round up so that a 1-unit change still counts as a change
-    reduction=$(( (original * DIM_BY_PERCENT + 99) / 100 ))
-    (( reduction < 1 )) && reduction=1
-
-    _target=$(( original - reduction ))
-    (( _target < min )) && _target=$min
-    (( _target < 0 )) && _target=0
+state_persist() {
+    local name=$1 val=$2 tmp="${STATE_DIR:?}/.$name.$$"
+    printf '%s\n' "$val" > "$tmp" 2>/dev/null && mv -f "$tmp" "${STATE_DIR}/$name" 2>/dev/null
 }
 
 # ==============================================================================
 # HARDWARE DISCOVERY
 # ==============================================================================
-
-# (Re-)scan /sys/class/backlight and (re-)open FDs. Reentrant.
 scan_backlights() {
-    local bl max_bright name state_file saved target
-    local -A seen=()
-
-    # Close stale FDs and drop entries for backlights that no longer exist
-    local existing_bl
-    for existing_bl in "${BACKLIGHTS[@]}"; do
-        seen[$existing_bl]=1
-    done
+    local bl max_bright name saved target
+    
+    # Clear arrays entirely to prevent memory leaks from unplugged monitors
+    BACKLIGHTS=()
+    BL_MAX=() BL_MIN=() BL_TOL=()
 
     for bl in "$SYSFS_BL"/*; do
         [[ -f "$bl/brightness" && -f "$bl/max_brightness" ]] || continue
-        [[ -n "${seen[$bl]:-}" ]] && continue   # already known and open
-
-        if ! sysfs_read_int "$bl/max_brightness" max_bright || (( max_bright <= 0 )); then
-            continue
-        fi
-
-        # Open persistent read FDs
-        local fd_br fd_max
-        if ! exec {fd_br}< "$bl/brightness" 2>/dev/null; then continue; fi
-        if ! exec {fd_max}< "$bl/max_brightness" 2>/dev/null; then
-            exec {fd_br}<&- 2>/dev/null
-            continue
-        fi
+        sysfs_read_int "$bl/max_brightness" max_bright || continue
+        (( max_bright <= 0 )) && continue
 
         BACKLIGHTS+=("$bl")
         BL_MAX[$bl]=$max_bright
         BL_MIN[$bl]=$(( max_bright * MIN_PERCENT / 100 < 1 ? 1 : max_bright * MIN_PERCENT / 100 ))
         BL_TOL[$bl]=$(( max_bright * 3 / 100 < 2 ? 2 : max_bright * 3 / 100 ))
-        BL_FD_BR[$bl]=$fd_br
-        BL_FD_MAX[$bl]=$fd_max
 
         name="${bl##*/}"
 
-        # Crash recovery: was a previous instance mid-dim when it died?
-        state_file="$STATE_DIR/$name"
-        if [[ -f "$state_file" ]]; then
-            if sysfs_read_int "$state_file" saved && (( saved > 0 && saved <= max_bright )); then
+        # Crash recovery
+        if [[ -f "$STATE_DIR/$name" ]]; then
+            if sysfs_read_int "$STATE_DIR/$name" saved && (( saved > 0 && saved <= max_bright )); then
                 BL_ORIG[$bl]=$saved
-                compute_dim_target "$saved" "$bl" target
-                if sysfs_write_int "$bl/brightness" "$target"; then
-                    log_msg "Recovered $name from stale state. Re-dimmed to ${target}/${max_bright}."
-                else
-                    log_msg "Recovered $name state (saved=$saved) but re-dim write failed."
-                fi
+                target=$(( saved - (saved * DIM_BY_PERCENT + 99) / 100 ))
+                (( target < BL_MIN[$bl] )) && target=${BL_MIN[$bl]}
+                sysfs_write_int "$bl/brightness" "$target" && \
+                    log_msg "Recovered $name to ${target}/${max_bright}."
             fi
-            rm -f "$state_file"
+            rm -f "${STATE_DIR:?}/$name"
         fi
     done
 }
 
-# (Re-)scan /sys/class/power_supply and (re-)open FDs. Reentrant.
 scan_power_supplies() {
-    local dev type name kind
-    local -A seen=()
-
-    for dev in "${POWER_SUPPLIES[@]}"; do
-        seen[$dev]=1
-    done
+    local dev type kind scope
+    POWER_SUPPLIES=() PS_KIND=() PS_SCOPE=()
 
     for dev in "$SYSFS_PS"/*; do
         [[ -f "$dev/type" ]] || continue
-        [[ -n "${seen[$dev]:-}" ]] && continue
-
-        if ! read -r type < "$dev/type" 2>/dev/null; then continue; fi
+        read -r type < "$dev/type" 2>/dev/null || continue
         type="${type,,}"
-        name="${dev##*/}"
 
         case "$type" in
-            mains|usb|usb_typec|usb_pd|wireless)
-                kind="input"
-                ;;
-            battery)
-                kind="battery"
-                ;;
-            *)
-                continue
-                ;;
+            mains|usb|usb_typec|usb_pd|wireless) kind="input" ;;
+            battery) kind="battery" ;;
+            *) continue ;;
         esac
 
-        local fd_type fd_online fd_status fd_scope fd_now fd_full fd_cap
-        exec {fd_type}< "$dev/type" 2>/dev/null || continue
-        if [[ "$kind" == "input" ]]; then
-            exec {fd_online}< "$dev/online" 2>/dev/null || { exec {fd_type}<&-; continue; }
-        else
-            fd_online=-1
-        fi
-        [[ -f "$dev/status"    ]] && { exec {fd_status}< "$dev/status"    2>/dev/null || fd_status=-1; } || fd_status=-1
-        [[ -f "$dev/scope"     ]] && { exec {fd_scope}< "$dev/scope"     2>/dev/null || fd_scope=-1;  } || fd_scope=-1
-        [[ -f "$dev/energy_now" ]] && { exec {fd_now}< "$dev/energy_now"  2>/dev/null || fd_now=-1;    } || fd_now=-1
-        [[ -f "$dev/energy_full" ]] && { exec {fd_full}< "$dev/energy_full" 2>/dev/null || fd_full=-1;  } || fd_full=-1
-        [[ -f "$dev/charge_now"  ]] && { exec {fd_cap}< "$dev/charge_now"   2>/dev/null || fd_cap=-1;   } || fd_cap=-1
-        # We also open charge_full/capacity as needed below
-        local fd_cfull fd_capacity
-        [[ -f "$dev/charge_full" ]] && { exec {fd_cfull}< "$dev/charge_full" 2>/dev/null || fd_cfull=-1;  } || fd_cfull=-1
-        [[ -f "$dev/capacity"    ]] && { exec {fd_capacity}< "$dev/capacity" 2>/dev/null || fd_capacity=-1; } || fd_capacity=-1
+        scope=""
+        [[ -f "$dev/scope" ]] && read -r scope < "$dev/scope" 2>/dev/null
 
         POWER_SUPPLIES+=("$dev")
         PS_KIND+=("$kind")
-        PS_NAME+=("$name")
-        PS_FD_TYPE+=("$fd_type")
-        PS_FD_ONLINE+=("$fd_online")
-        PS_FD_STATUS+=("$fd_status")
-        PS_FD_SCOPE+=("$fd_scope")
-        PS_FD_NOW+=("$fd_now")
-        PS_FD_FULL+=("$fd_full")
-        PS_FD_CAP+=("$fd_cfull")     # repurposed slot for charge_full
-        # We don't have a 7th slot, so for capacity we'll fall back to one-shot read
+        PS_SCOPE+=("${scope,,}")
     done
 }
 
 # ==============================================================================
 # TELEMETRY
 # ==============================================================================
-
-# Walk all known power supplies and update BATTERY_PCT / SHOULD_DIM / POWER_INPUT.
 update_telemetry() {
-    local i dev kind scope status online b_now b_full b_cap pct lowest
+    local i dev kind status online b_now b_full pct lowest=100
     local has_battery=0 mains_online=0 any_discharging=0 any_charging=0
-    local -a bat_pcts=()
 
-    BATTERY_PCT=100
-    SHOULD_DIM=0
-    POWER_INPUT=0
+    BATTERY_PCT=100 SHOULD_DIM=0 POWER_INPUT=0
 
     for ((i = 0; i < ${#POWER_SUPPLIES[@]}; i++)); do
+        dev=${POWER_SUPPLIES[i]}
         kind=${PS_KIND[i]}
 
         if [[ "$kind" == "input" ]]; then
-            if sysfs_fd_read_int "${PS_FD_ONLINE[i]}" online; then
-                (( online == 1 )) && mains_online=1
-            fi
+            sysfs_read_int "$dev/online" online || online=0
+            (( online == 1 )) && mains_online=1
             continue
         fi
 
-        # kind == battery
-        # Skip device-scope batteries (peripherals, not the laptop)
-        scope=""
-        if (( ${PS_FD_SCOPE[i]} >= 0 )); then
-            read -r scope <&"${PS_FD_SCOPE[i]}" 2>/dev/null
-            [[ "${scope,,}" == "device" ]] && continue
-        fi
+        [[ "${PS_SCOPE[i]}" == "device" ]] && continue
 
-        status=""
-        if (( ${PS_FD_STATUS[i]} >= 0 )); then
-            read -r status <&"${PS_FD_STATUS[i]}" 2>/dev/null
-        fi
-
+        [[ -f "$dev/status" ]] && read -r status < "$dev/status" 2>/dev/null || status=""
         case "${status,,}" in
             discharging) any_discharging=1 ;;
             charging|full|"not charging") any_charging=1 ;;
-            *) ;;  # unknown / idle — don't conclude
         esac
 
-        b_now=0; b_full=0
-        if (( ${PS_FD_NOW[i]} >= 0 )) && (( ${PS_FD_FULL[i]} >= 0 )); then
-            sysfs_fd_read_int "${PS_FD_NOW[i]}"  b_now  || b_now=0
-            sysfs_fd_read_int "${PS_FD_FULL[i]}" b_full || b_full=0
-        elif (( ${PS_FD_CAP[i]} >= 0 )); then
-            # slot reused: we stored charge_full in CAP index
-            sysfs_fd_read_int "${PS_FD_CAP[i]}" b_full || b_full=0
-            # for charge_now we don't have a cached slot — one-shot read
-            local dev=${POWER_SUPPLIES[i]}
-            sysfs_read_int "$dev/charge_now" b_now || b_now=0
-        elif [[ -f "${POWER_SUPPLIES[i]}/capacity" ]]; then
-            sysfs_read_int "${POWER_SUPPLIES[i]}/capacity" b_now || b_now=0
+        b_now=0 b_full=0
+        if [[ -f "$dev/energy_now" && -f "$dev/energy_full" ]]; then
+            sysfs_read_int "$dev/energy_now" b_now; sysfs_read_int "$dev/energy_full" b_full
+        elif [[ -f "$dev/charge_now" && -f "$dev/charge_full" ]]; then
+            sysfs_read_int "$dev/charge_now" b_now; sysfs_read_int "$dev/charge_full" b_full
+        elif [[ -f "$dev/capacity" ]]; then
+            sysfs_read_int "$dev/capacity" b_now
             b_full=100
         fi
 
+        # Safeguard division by zero and faulty sensors
         (( b_full <= 0 )) && continue
 
         pct=$(( b_now * 100 / b_full ))
         (( pct > 100 )) && pct=100
-        (( pct < 0  )) && pct=0
-
-        bat_pcts+=("$pct")
+        (( pct < lowest )) && lowest=$pct
         has_battery=1
     done
 
     POWER_INPUT=$mains_online
+    (( ! has_battery )) && { BATTERY_PCT=-1; return; }
 
-    if (( ! has_battery )); then
-        # No battery we care about — never dim
-        BATTERY_PCT=-1
-        SHOULD_DIM=0
-        return
-    fi
-
-    # Lowest battery determines our state
-    lowest=100
-    for pct in "${bat_pcts[@]}"; do
-        (( pct < lowest )) && lowest=$pct
-    done
     BATTERY_PCT=$lowest
-
-    if (( mains_online )); then
-        SHOULD_DIM=0
-    elif (( any_charging )) && (( ! any_discharging )); then
-        # All batteries report non-discharging, no mains: weird state, don't dim
+    if (( mains_online || (any_charging && ! any_discharging) )); then
         SHOULD_DIM=0
     else
         (( lowest <= THRESHOLD )) && SHOULD_DIM=1
@@ -482,109 +253,82 @@ update_telemetry() {
 # ==============================================================================
 # ACTIONS
 # ==============================================================================
-
-# Dim every backlight that is not overridden, on the dim path.
 apply_dim() {
-    local bl name current target orig_saved tol diff
+    local bl name current target orig_saved diff reduction
     for bl in "${BACKLIGHTS[@]}"; do
         name="${bl##*/}"
+        [[ ${BL_OVERRIDE[$name]:-0} == 1 ]] && continue
 
-        # User has explicitly released control; skip until the next power cycle
-        [[ ${BL_OVERRIDE[$name]:-} == 1 ]] && continue
-
-        current=0
-        sysfs_fd_read_int "${BL_FD_BR[$bl]}" current || current=0
+        sysfs_read_int "$bl/brightness" current || current=0
 
         if [[ -z "${BL_ORIG[$bl]:-}" ]]; then
-            # First entry into dim for this backlight
-            compute_dim_target "$current" "$bl" target
+            reduction=$(( (current * DIM_BY_PERCENT + 99) / 100 ))
+            (( reduction < 1 )) && reduction=1
+            target=$(( current - reduction ))
+            (( target < BL_MIN[$bl] )) && target=${BL_MIN[$bl]}
+
             if (( current > target )); then
                 BL_ORIG[$bl]=$current
-                # Persist for crash recovery (atomic)
-                local state_tmp=$STATE_DIR/.${name}.tmp
-                printf '%s\n' "$current" > "$state_tmp" 2>/dev/null \
-                    && mv -f "$state_tmp" "$STATE_DIR/$name" 2>/dev/null
+                state_persist "$name" "$current"
                 if sysfs_write_int "$bl/brightness" "$target"; then
-                    log_msg "Dimmed $name by ${DIM_BY_PERCENT}% (${current}->${target}, battery=${BATTERY_PCT}%)"
+                    log_msg "Dimmed $name by ${DIM_BY_PERCENT}% (${current}->${target}, bat=${BATTERY_PCT}%)"
                 else
-                    log_msg "Dim write failed for $name; releasing control."
                     unset 'BL_ORIG[$bl]'
                     BL_OVERRIDE[$name]=1
                 fi
             fi
         else
-            # Maintaining dim; check for user override
             orig_saved=${BL_ORIG[$bl]}
-            compute_dim_target "$orig_saved" "$bl" target
+            reduction=$(( (orig_saved * DIM_BY_PERCENT + 99) / 100 ))
+            target=$(( orig_saved - reduction ))
+            (( target < BL_MIN[$bl] )) && target=${BL_MIN[$bl]}
+            
             diff=$(( current - target ))
             (( diff < 0 )) && diff=$(( -diff ))
-            tol=${BL_TOL[$bl]}
 
-            if (( diff > tol )); then
-                local max=${BL_MAX[$bl]}
-                if (( current >= max )); then
-                    if (( SUSPEND_OCCURRED == 1 )); then
-                        # Likely a resume that reset brightness to max
-                        if sysfs_write_int "$bl/brightness" "$target"; then
-                            log_msg "Suspend/resume detected on $name. Re-applied dim."
-                        fi
-                    else
-                        # User cranked it to max — release until next power cycle
-                        unset 'BL_ORIG[$bl]'
-                        BL_OVERRIDE[$name]=1
-                        rm -f "$STATE_DIR/$name"
-                        log_msg "User set max brightness on $name. Releasing control."
-                    fi
-                else
-                    # User nudged it — release control
-                    unset 'BL_ORIG[$bl]'
-                    BL_OVERRIDE[$name]=1
-                    rm -f "$STATE_DIR/$name"
-                    log_throttled "$name" "Manual override on $name. Releasing control."
-                fi
+            # If suspend occurred, IGNORE tolerance check, because random 
+            # kernel brightness changes on wake are not user overrides.
+            if (( SUSPEND_OCCURRED == 1 )); then
+                sysfs_write_int "$bl/brightness" "$target" && \
+                    log_msg "Suspend/resume detected. Re-applied dim on $name."
+            elif (( diff > BL_TOL[$bl] )); then
+                unset 'BL_ORIG[$bl]'
+                BL_OVERRIDE[$name]=1
+                rm -f "${STATE_DIR:?}/$name"
+                log_throttled "$name" "Override detected on $name (diff=$diff). Released control."
             fi
         fi
     done
 }
 
-# Restore every dimmed backlight on the restore path.
 apply_restore() {
-    local bl name current orig_saved dimmed_set diff
+    local bl name current orig_saved dimmed_set diff reduction
     for bl in "${BACKLIGHTS[@]}"; do
         name="${bl##*/}"
 
         if [[ -n "${BL_ORIG[$bl]:-}" ]]; then
             orig_saved=${BL_ORIG[$bl]}
-            current=0
-            sysfs_fd_read_int "${BL_FD_BR[$bl]}" current || current=0
+            sysfs_read_int "$bl/brightness" current || current=0
 
-            compute_dim_target "$orig_saved" "$bl" dimmed_set
+            reduction=$(( (orig_saved * DIM_BY_PERCENT + 99) / 100 ))
+            dimmed_set=$(( orig_saved - reduction ))
+            (( dimmed_set < BL_MIN[$bl] )) && dimmed_set=${BL_MIN[$bl]}
+            
             diff=$(( current - dimmed_set ))
             (( diff < 0 )) && diff=$(( -diff ))
 
-            if (( diff <= BL_TOL[$bl] )); then
-                # Brightness is at our dimmed value — restore it
-                if sysfs_write_int "$bl/brightness" "$orig_saved"; then
-                    log_msg "Restored $name to original brightness (${orig_saved})."
-                else
-                    log_msg "Restore write failed for $name."
-                fi
-            else
-                # User changed it during dim — don't fight them
-                log_throttled "$name" "Override detected on $name. Keeping user brightness."
+            # Even on wake up, if we plug in power, we want to restore.
+            if (( diff <= BL_TOL[$bl] || SUSPEND_OCCURRED == 1 )); then
+                sysfs_write_int "$bl/brightness" "$orig_saved" && \
+                    log_msg "Restored $name to original ($orig_saved)."
             fi
+            
             unset 'BL_ORIG[$bl]'
-            rm -f "$STATE_DIR/$name"
+            rm -f "${STATE_DIR:?}/$name"
         fi
 
-        # Re-engage on next low-battery event after a power cycle / full charge
-        if [[ ${BL_OVERRIDE[$name]:-} == 1 ]] && (( POWER_INPUT == 0 )); then
-            # Only clear override when the user has truly "moved on" — i.e.,
-            # the laptop has been unplugged. We don't auto-clear on every
-            # restore iteration; that would re-engage on the very next dim.
-            # Keeping the user's "release control" sticky for the session.
-            :
-        fi
+        # Power input clears previous user overrides
+        (( POWER_INPUT == 1 )) && BL_OVERRIDE[$name]=0
     done
 }
 
@@ -592,71 +336,44 @@ apply_restore() {
 # CLEANUP
 # ==============================================================================
 cleanup() {
-    # Guard against recursive trap firing
-    (( CLEANING_UP )) && return 0
+    trap '' EXIT SIGINT SIGTERM SIGHUP SIGQUIT # Prevent re-entrancy
+    (( CLEANING_UP )) && exit 0
     CLEANING_UP=1
 
-    log_msg "Service stopping. Restoring original brightness..."
-
+    log_msg "Stopping. Restoring backlights..."
     local bl val
-    for bl in "${BACKLIGHTS[@]}"; do
+    for bl in "${BACKLIGHTS[@]:-}"; do
         val=${BL_ORIG[$bl]:-}
-        if [[ -n "$val" && "$val" -gt 0 ]]; then
-            sysfs_write_int "$bl/brightness" "$val"
-        fi
-    done
-
-    # Close all FDs explicitly (defensive; process exit would do it anyway)
-    local fd
-    for fd in "${BL_FD_BR[@]}" "${BL_FD_MAX[@]}" "${PS_FD_TYPE[@]}" \
-              "${PS_FD_ONLINE[@]}" "${PS_FD_STATUS[@]}" "${PS_FD_SCOPE[@]}" \
-              "${PS_FD_NOW[@]}" "${PS_FD_FULL[@]}" "${PS_FD_CAP[@]}"; do
-        if (( fd >= 0 )) 2>/dev/null; then
-            exec {fd}<&- 2>/dev/null
-        fi
+        [[ -n "$val" ]] && sysfs_write_int "$bl/brightness" "$val"
     done
 
     exec 8<&- 2>/dev/null
-    exec 7>&- 2>/dev/null
     exec 9>&- 2>/dev/null
-
-    rm -rf "$STATE_DIR"
-
-    # Preserve original exit code if we were killed by a signal
-    local rc=$?
-    if (( rc == 0 )); then rc=0; fi
-    exit "$rc"
+    
+    # ${STATE_DIR:?} guarantees we never accidentally rm -rf /
+    rm -rf "${STATE_DIR:?}" "$LOCK_FILE"
+    exit 0
 }
 
 trap cleanup EXIT SIGINT SIGTERM SIGHUP SIGQUIT
 
 # ==============================================================================
-# MAIN
+# MAIN LOOP
 # ==============================================================================
 scan_backlights
 scan_power_supplies
-
-if (( ${#BACKLIGHTS[@]} == 0 )); then
-    log_msg "No backlights found. Service is a no-op."
-    # Still hold the lock and stay alive so we don't flap if a backlight appears
-fi
-
-log_msg "Service started. Threshold=${THRESHOLD}%, Dim=${DIM_BY_PERCENT}%, Floor=${MIN_PERCENT}%, Poll=${POLL_INTERVAL}s, Backlights=${#BACKLIGHTS[@]}, PowerSupplies=${#POWER_SUPPLIES[@]}"
-
-LAST_TICK=$SECONDS
-SUSPEND_OCCURRED=0
+log_msg "Started. Threshold=${THRESHOLD}%, Dim=${DIM_BY_PERCENT}%, Poll=${POLL_INTERVAL}s."
 
 while true; do
-    # Suspend detection: if the wall clock jumped more than SUSPEND_THRESHOLD,
-    # assume we just resumed from suspend. $SECONDS in bash is wall-clock-based.
     local_now=$SECONDS
-    elapsed=$(( local_now - LAST_TICK ))
-    if (( elapsed > SUSPEND_THRESHOLD )); then
+    # True drift calculation
+    drift=$(( local_now - LAST_TICK - POLL_INTERVAL ))
+    
+    if (( drift > SUSPEND_THRESHOLD )); then
         SUSPEND_OCCURRED=1
-        log_msg "Suspend/resume detected (drift=${elapsed}s). Will re-apply dim if needed."
-        # Brief settle — some drivers take a moment to be writable after resume
-        sleep "$RECOVERY_SETTLE"
-        # Force a hardware re-scan to re-open any FDs invalidated by the resume
+        log_msg "Suspend/resume detected (drift=${drift}s)."
+        # Let GPU/Drivers settle before scanning
+        read -t "$RECOVERY_SETTLE" -u 8 || true
         scan_backlights
         scan_power_supplies
     else
@@ -664,28 +381,16 @@ while true; do
     fi
     LAST_TICK=$local_now
 
-    # Periodic hotplug re-scan
-    (( POLL_COUNT++ ))
-    if (( POLL_COUNT % RESCAN_EVERY == 0 )); then
-        scan_backlights
-        scan_power_supplies
-    fi
+    (( ++POLL_COUNT % RESCAN_EVERY == 0 )) && { scan_backlights; scan_power_supplies; }
 
     update_telemetry
 
-    if (( BATTERY_PCT < 0 )); then
-        # No battery — sleep and try again
-        read -t "$POLL_INTERVAL" -u 8 || true
-        continue
+    if (( BATTERY_PCT >= 0 )); then
+        (( SHOULD_DIM == 1 )) && apply_dim || apply_restore
     fi
 
-    if (( SHOULD_DIM == 1 )); then
-        apply_dim
-    else
-        apply_restore
-    fi
-
-    # Zero-fork sleep: read on an always-open FIFO blocks until either data
-    # arrives or the timeout fires.
+    # Update tick immediately prior to sleep to prevent execution time drift
+    LAST_TICK=$SECONDS
+    # Zero-fork sleep. Data will never arrive on FD 8.
     read -t "$POLL_INTERVAL" -u 8 || true
 done
