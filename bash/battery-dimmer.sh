@@ -1,20 +1,39 @@
 #!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# battery-dimmer.sh — Dim backlight on low battery, restore when charging/charged.
+# Zero-fork hot path, crash-safe, thermally friendly.
+#
 
 # ==============================================================================
-# CONFIGURATION & ENVIRONMENT
+# STRICT MODE & ERRORS
 # ==============================================================================
-export LC_ALL=C
+# Note: NOT using `set -e` because we want to continue on non-fatal errors
+# (e.g., a single backlight being unwritable).
 
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
 THRESHOLD=50
 DIM_BY_PERCENT=30
 MIN_PERCENT=5
+SUSPEND_THRESHOLD=15   # seconds of drift to consider a suspend/resume
+POLL_INTERVAL=10       # seconds between checks
+LOG_THROTTLE=30        # minimum seconds between identical log messages
 
 STATE_DIR="/run/battery-dimmer"
 LOCK_FILE="$STATE_DIR/lock"
+LOG_FILE="/var/log/battery-dimmer.log"
+SLEEP_FIFO="$STATE_DIR/.sleep_fifo"
 
-# Require Bash 4.3+ for Namerefs (local -n)
+# ==============================================================================
+# PREFLIGHT
+# ==============================================================================
+export LC_ALL=C
+
+# Require Bash 4.3+ for `printf '%(...)T'` and `local -n`
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
-    echo "Error: Bash 4.3+ required for zero-fork nameref optimization." >&2
+    echo "Error: Bash 4.3+ required." >&2
     exit 1
 fi
 
@@ -24,295 +43,328 @@ if [[ "$EUID" -ne 0 ]]; then
 fi
 
 mkdir -p "$STATE_DIR"
+
 exec 9> "$LOCK_FILE"
 if ! flock -n 9; then
     echo "Error: Service already running." >&2
     exit 1
 fi
 
+# Persistent FDs: 7 = log, 8 = sleep FIFO (open in read+write mode to keep it alive)
+exec 7>> "$LOG_FILE"
+mkfifo "$SLEEP_FIFO" 2>/dev/null
+exec 8<> "$SLEEP_FIFO"
+
 shopt -s nullglob
 
 # ==============================================================================
-# HELPER FUNCTIONS (ZERO FORKS)
+# GLOBALS (state shared with helpers)
+# ==============================================================================
+declare -A BL_MAX BL_TOLERANCE BL_MIN MEM_ORIGINAL OVERRIDES LOG_LAST
+declare -a VALID_BACKLIGHTS
+declare -a POWER_SUPPLIES
+GLOBAL_BAT_PERCENT=100
+GLOBAL_POWER_STATE="charging"
+
+# ==============================================================================
+# HELPER FUNCTIONS
 # ==============================================================================
 
-# Safely read integers from sysfs without subshells.
-# Usage: read_sysfs_int "/path" return_var_name
+# Pure-Bash timestamped log. No fork, no `date`.
+log_msg() {
+    local msg
+    printf -v msg '%(%Y-%m-%d %H:%M:%S)T battery-dimmer: %s\n' -1 "$1"
+    echo "$msg" >&7
+}
+
+# Throttled log: only emits if the same key hasn't been logged recently.
+log_throttled() {
+    local key=$1
+    local text=$2
+    local now=$SECONDS
+    local last=${LOG_LAST[$key]:-0}
+    if (( now - last >= LOG_THROTTLE )); then
+        LOG_LAST[$key]=$now
+        log_msg "$text"
+    fi
+}
+
+# Fast integer read from a sysfs file. Uses nameref to avoid subshells.
 read_sysfs_int() {
-    local -n _ret_ref=$2
-    local _val
-    # Native read. Using file descriptor instead of redirection pipeline.
-    read -r _val < "$1" 2>/dev/null
-    _val="${_val//[^0-9]/}"
-    _ret_ref="${_val:-0}"
-}
-
-# Math check without subshells
-# Usage: is_within_tolerance current target max return_var_name
-is_within_tolerance() {
-    local -n _ret_ref=$4
-    local diff=$(( $1 - $2 ))
-    diff="${diff#-}" 
-    
-    local tolerance=$(( $3 * 3 / 100 ))
-    (( tolerance < 2 )) && tolerance=2 
-    
-    if (( diff <= tolerance )); then
-        _ret_ref=1 # True
+    local -n _out=$2
+    local _raw
+    read -r _raw < "$1" 2>/dev/null
+    if [[ "$_raw" == *[!0-9]* || -z "$_raw" ]]; then
+        _out=0
     else
-        _ret_ref=0 # False
+        _out=$_raw
     fi
 }
 
-# Updates global variables GLOBAL_BAT_PERCENT directly
-update_global_battery_percent() {
-    local lowest_percent=100
-    local battery_found=0
-    local type_val scope_val
-    local present_val b_now b_full pct
+# Single-pass telemetry: read all power supplies, compute lowest battery %.
+update_telemetry() {
+    GLOBAL_BAT_PERCENT=100
+    GLOBAL_POWER_STATE="charging"
+    local lowest=100
+    local bat_found=0
 
-    for bat in /sys/class/power_supply/*; do
-        [[ -f "$bat/present" ]] && { read_sysfs_int "$bat/present" present_val; (( present_val != 1 )) && continue; }
-        
-        if [[ -f "$bat/type" ]]; then
-            read -r type_val < "$bat/type" 2>/dev/null
-            if [[ "${type_val,,}" == *"battery"* ]]; then
-                if [[ -f "$bat/scope" ]]; then
-                    read -r scope_val < "$bat/scope" 2>/dev/null
-                    [[ "${scope_val,,}" == *"device"* ]] && continue
-                fi
-                
-                b_now=0; b_full=0
-                
-                if [[ -f "$bat/energy_now" && -f "$bat/energy_full" ]]; then
-                    read_sysfs_int "$bat/energy_now" b_now
-                    read_sysfs_int "$bat/energy_full" b_full
-                elif [[ -f "$bat/charge_now" && -f "$bat/charge_full" ]]; then
-                    read_sysfs_int "$bat/charge_now" b_now
-                    read_sysfs_int "$bat/charge_full" b_full
-                elif [[ -f "$bat/capacity" ]]; then
-                    read_sysfs_int "$bat/capacity" b_now
-                    b_full=100
-                fi
-                
-                if (( b_full > 0 )); then
-                    # NATIVE BASH MATH: Avoids awk and avoids 32-bit overflow by dividing the divisor first.
-                    if (( b_full >= 100 )); then
-                        pct=$(( b_now / (b_full / 100) ))
-                    else
-                        # Edge case where full capacity is physically less than 100 units
-                        pct=$(( (b_now * 100) / b_full ))
-                    fi
-                    
-                    (( pct > 100 )) && pct=100
-                    
-                    battery_found=1
-                    (( pct < lowest_percent )) && lowest_percent=$pct
-                fi
+    local dev type online scope status b_now b_full pct
+    for dev in "${POWER_SUPPLIES[@]}"; do
+        [[ -f "$dev/type" ]] || continue
+        read -r type < "$dev/type" 2>/dev/null
+        type="${type,,}"
+
+        if [[ "$type" == "mains" || "$type" == "usb" ]]; then
+            read -r online < "$dev/online" 2>/dev/null
+            if [[ "$online" == "1" ]]; then
+                GLOBAL_POWER_STATE="charging"
+            fi
+        elif [[ "$type" == "battery" ]]; then
+            if [[ -f "$dev/scope" ]]; then
+                read -r scope < "$dev/scope" 2>/dev/null
+                [[ "${scope,,}" == *"device"* ]] && continue
+            fi
+
+            status="unknown"
+            if [[ -f "$dev/status" ]]; then
+                read -r status < "$dev/status" 2>/dev/null
+            fi
+
+            if [[ "$GLOBAL_POWER_STATE" != "charging" && "${status,,}" == "discharging" ]]; then
+                GLOBAL_POWER_STATE="discharging"
+            fi
+
+            b_now=0
+            b_full=0
+            if [[ -f "$dev/energy_now" && -f "$dev/energy_full" ]]; then
+                read_sysfs_int "$dev/energy_now" b_now
+                read_sysfs_int "$dev/energy_full" b_full
+            elif [[ -f "$dev/charge_now" && -f "$dev/charge_full" ]]; then
+                read_sysfs_int "$dev/charge_now" b_now
+                read_sysfs_int "$dev/charge_full" b_full
+            elif [[ -f "$dev/capacity" ]]; then
+                read_sysfs_int "$dev/capacity" b_now
+                b_full=100
+            fi
+
+            if (( b_full > 0 )); then
+                pct=$(( (b_now * 100) / b_full ))
+                (( pct > 100 )) && pct=100
+                (( pct < 0 )) && pct=0
+                (( pct < lowest )) && lowest=$pct
+                bat_found=1
             fi
         fi
     done
 
-    if (( battery_found == 1 )); then
-        GLOBAL_BAT_PERCENT=$lowest_percent
+    if (( bat_found )); then
+        GLOBAL_BAT_PERCENT=$lowest
     else
-        GLOBAL_BAT_PERCENT="ERROR"
+        GLOBAL_BAT_PERCENT=-1   # sentinel for "no battery found"
     fi
 }
 
-# Updates global variable GLOBAL_POWER_STATE directly
-update_global_power_state() {
-    local type_val status_val online_val
-    GLOBAL_POWER_STATE="charging" # Default
+# Compute the dimmed target brightness for a given original value.
+# Guarantees a minimum of 1 unit reduction and respects the floor.
+compute_dim_target() {
+    local original=$1
+    local max=$2
+    local min=${BL_MIN[$max]:-$(($max * MIN_PERCENT / 100))}
+    (( min < 1 )) && min=1
 
-    # AC Check
-    for ac in /sys/class/power_supply/*; do
-        if [[ -f "$ac/type" ]]; then
-            read -r type_val < "$ac/type" 2>/dev/null
-            type_val="${type_val,,}"
-            if [[ "$type_val" == *"mains"* || "$type_val" == *"usb"* ]]; then
-                read_sysfs_int "$ac/online" online_val
-                if (( online_val == 1 )); then
-                    GLOBAL_POWER_STATE="charging"
-                    return
-                fi
-            fi
-        fi
-    done
-    
-    # Battery Check
-    for bat in /sys/class/power_supply/*; do
-        if [[ -f "$bat/type" && -f "$bat/status" ]]; then
-            read -r type_val < "$bat/type" 2>/dev/null
-            if [[ "${type_val,,}" == *"battery"* ]]; then
-                read -r status_val < "$bat/status" 2>/dev/null
-                if [[ "${status_val,,}" == "discharging" ]]; then
-                    GLOBAL_POWER_STATE="discharging"
-                    return
-                fi
-            fi
-        fi
-    done
+    local reduction=$(( original * DIM_BY_PERCENT / 100 ))
+    (( reduction < 1 )) && reduction=1
+
+    local target=$(( original - reduction ))
+    (( target < min )) && target=$min
+    echo "$target"
 }
 
 # ==============================================================================
-# INITIALIZATION
+# INITIALIZATION: cache backlight metadata, recover from crash
 # ==============================================================================
-# Use Hash Map (associative array) to guarantee $O(1) uniqueness natively
-declare -A UNIQUE_BACKLIGHTS
-for bl in /sys/class/backlight/intel_backlight /sys/class/backlight/amdgpu_bl* /sys/class/backlight/nv_backlight /sys/class/backlight/*; do
-    if [[ -f "$bl/brightness" && -f "$bl/max_brightness" ]]; then
-        read_sysfs_int "$bl/max_brightness" _max_bl
-        (( _max_bl > 0 )) && UNIQUE_BACKLIGHTS["$bl"]=1
+
+# Cache power supply list (rarely hotplugs on laptops).
+mapfile -t POWER_SUPPLIES < <(compgen -G "/sys/class/power_supply/*" 2>/dev/null || true)
+
+# Discover backlights, dedupe, pre-calc constants, handle crash recovery.
+declare -A SEEN_BL
+for bl in /sys/class/backlight/*; do
+    [[ -n "${SEEN_BL[$bl]}" ]] && continue
+    [[ -f "$bl/brightness" && -f "$bl/max_brightness" ]] || continue
+    SEEN_BL[$bl]=1
+
+    local_max=0
+    read_sysfs_int "$bl/max_brightness" local_max
+    if (( local_max <= 0 )); then
+        continue
+    fi
+
+    VALID_BACKLIGHTS+=("$bl")
+    BL_MAX[$bl]=$local_max
+
+    # Tolerance: 3% of max, minimum 2 units
+    local_tol=$(( local_max * 3 / 100 ))
+    (( local_tol < 2 )) && local_tol=2
+    BL_TOLERANCE[$bl]=$local_tol
+
+    # Minimum brightness floor
+    local_min=$(( local_max * MIN_PERCENT / 100 ))
+    (( local_min < 1 )) && local_min=1
+    BL_MIN[$bl]=$local_min
+
+    # Crash recovery: restore original + re-apply dim immediately
+    bl_name="${bl##*/}"
+    state_file="$STATE_DIR/$bl_name"
+    if [[ -f "$state_file" ]]; then
+        saved=0
+        read_sysfs_int "$state_file" saved
+        if (( saved > 0 && saved <= local_max )); then
+            MEM_ORIGINAL[$bl]=$saved
+            target=$(compute_dim_target "$saved" "$local_max")
+            if echo "$target" > "$bl/brightness" 2>/dev/null; then
+                log_msg "Recovered $bl_name from stale state. Re-dimmed to ${target}/${local_max}."
+            fi
+        fi
+        rm -f "$state_file"
     fi
 done
-VALID_BACKLIGHTS=("${!UNIQUE_BACKLIGHTS[@]}")
 
-# Crash Recovery
-if [[ -d "$STATE_DIR" ]]; then
-    for bl in "${VALID_BACKLIGHTS[@]}"; do
-        bl_name="${bl##*/}"
-        state_file="$STATE_DIR/$bl_name"
-        if [[ -f "$state_file" ]]; then
-            logger -t battery-dimmer "Found stale state from crash. Restoring $bl_name."
-            read_sysfs_int "$state_file" _stale_val
-            echo "$_stale_val" > "$bl/brightness" 2>/dev/null
-            rm -f "$state_file"
-        fi
-    done
-fi
-
+# ==============================================================================
+# CLEANUP
+# ==============================================================================
 cleanup() {
-    logger -t battery-dimmer "Service stopping. Restoring original brightness..."
-    local _orig_val
+    log_msg "Service stopping. Restoring original brightness..."
+    local bl val
     for bl in "${VALID_BACKLIGHTS[@]}"; do
-        bl_name="${bl##*/}"
-        state_file="$STATE_DIR/$bl_name"
-        
-        if [[ -f "$state_file" ]]; then
-            read_sysfs_int "$state_file" _orig_val
-            if (( _orig_val > 0 )) && [[ -w "$bl/brightness" ]]; then
-                echo "$_orig_val" > "$bl/brightness" 2>/dev/null
-            fi
+        val=${MEM_ORIGINAL[$bl]}
+        if [[ -n "$val" ]] && (( val > 0 )); then
+            echo "$val" > "$bl/brightness" 2>/dev/null
         fi
     done
     rm -rf "$STATE_DIR"
     exit 0
 }
-
-trap cleanup EXIT SIGINT SIGTERM SIGHUP
+trap cleanup EXIT SIGINT SIGTERM SIGHUP SIGQUIT
 
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
-logger -t battery-dimmer "Service started. Threshold: ${THRESHOLD}%, Dim: ${DIM_BY_PERCENT}%"
+log_msg "Service started. Threshold: ${THRESHOLD}%, Dim: ${DIM_BY_PERCENT}%, Polling: ${POLL_INTERVAL}s"
 
-# $SECONDS natively tracks time since script start with 0 CPU overhead
 last_tick=$SECONDS
-declare GLOBAL_BAT_PERCENT GLOBAL_POWER_STATE
+SUSPEND_OCCURRED=0
 
 while true; do
     current_tick=$SECONDS
     elapsed=$(( current_tick - last_tick ))
-    
-    if (( elapsed > 30 )); then
+
+    if (( elapsed > SUSPEND_THRESHOLD )); then
         SUSPEND_OCCURRED=1
     else
         SUSPEND_OCCURRED=0
     fi
     last_tick=$current_tick
 
-    update_global_battery_percent
-    update_global_power_state
+    update_telemetry
 
-    if [[ "$GLOBAL_BAT_PERCENT" == "ERROR" ]]; then
-        sleep 15 & wait $!
-        last_tick=$SECONDS
+    # No battery present — just sleep
+    if (( GLOBAL_BAT_PERCENT < 0 )); then
+        read -t "$POLL_INTERVAL" -u 8 || true
         continue
     fi
 
+    # === DIM PATH: low battery + discharging ===
     if (( GLOBAL_BAT_PERCENT <= THRESHOLD )) && [[ "$GLOBAL_POWER_STATE" == "discharging" ]]; then
         for bl in "${VALID_BACKLIGHTS[@]}"; do
-            [[ ! -w "$bl/brightness" ]] && continue
-            
             bl_name="${bl##*/}"
-            state_file="$STATE_DIR/$bl_name"
-            override_file="$STATE_DIR/${bl_name}.override"
 
-            [[ -f "$override_file" ]] && continue
+            # User has set manual override — leave it alone
+            [[ ${OVERRIDES[$bl_name]} == 1 ]] && continue
 
+            CURRENT_BRIGHTNESS=0
             read_sysfs_int "$bl/brightness" CURRENT_BRIGHTNESS
-            read_sysfs_int "$bl/max_brightness" MAX_BRIGHTNESS
-            
-            MIN_BRIGHTNESS=$(( MAX_BRIGHTNESS * MIN_PERCENT / 100 ))
-            (( MIN_BRIGHTNESS <= 0 )) && MIN_BRIGHTNESS=1
 
-            if [[ ! -f "$state_file" ]]; then
-                TARGET_BRIGHTNESS=$(( CURRENT_BRIGHTNESS - (CURRENT_BRIGHTNESS * DIM_BY_PERCENT / 100) ))
-                (( TARGET_BRIGHTNESS < MIN_BRIGHTNESS )) && TARGET_BRIGHTNESS=$MIN_BRIGHTNESS
-
-                if (( CURRENT_BRIGHTNESS > TARGET_BRIGHTNESS )); then
-                    echo "$CURRENT_BRIGHTNESS" > "$state_file"
-                    echo "$TARGET_BRIGHTNESS" > "$bl/brightness" 2>/dev/null
-                    logger -t battery-dimmer "Dimmed $bl_name by ${DIM_BY_PERCENT}% (Battery: ${GLOBAL_BAT_PERCENT}%)"
+            if [[ -z "${MEM_ORIGINAL[$bl]}" ]]; then
+                # First time entering dim state for this backlight
+                target=$(compute_dim_target "$CURRENT_BRIGHTNESS" "$bl")
+                if (( CURRENT_BRIGHTNESS > target )); then
+                    MEM_ORIGINAL[$bl]=$CURRENT_BRIGHTNESS
+                    echo "$CURRENT_BRIGHTNESS" > "$STATE_DIR/$bl_name"
+                    if echo "$target" > "$bl/brightness" 2>/dev/null; then
+                        log_msg "Dimmed $bl_name by ${DIM_BY_PERCENT}% (Battery: ${GLOBAL_BAT_PERCENT}%)"
+                    fi
                 fi
             else
-                read_sysfs_int "$state_file" ORIGINAL_SAVED
-                TARGET_BRIGHTNESS=$(( ORIGINAL_SAVED - (ORIGINAL_SAVED * DIM_BY_PERCENT / 100) ))
-                (( TARGET_BRIGHTNESS < MIN_BRIGHTNESS )) && TARGET_BRIGHTNESS=$MIN_BRIGHTNESS
+                # We are maintaining the dim; check for user override
+                ORIGINAL_SAVED=${MEM_ORIGINAL[$bl]}
+                target=$(compute_dim_target "$ORIGINAL_SAVED" "$bl")
+                diff=$(( CURRENT_BRIGHTNESS - target ))
+                (( diff < 0 )) && diff=$(( -diff ))
+                tolerance=${BL_TOLERANCE[$bl]}
 
-                is_within_tolerance "$CURRENT_BRIGHTNESS" "$TARGET_BRIGHTNESS" "$MAX_BRIGHTNESS" IN_TOLERANCE
-                if (( IN_TOLERANCE == 0 )); then
-                    if (( CURRENT_BRIGHTNESS == MAX_BRIGHTNESS )); then
+                if (( diff > tolerance )); then
+                    if (( CURRENT_BRIGHTNESS >= BL_MAX[$bl] )); then
                         if (( SUSPEND_OCCURRED == 1 )); then
-                            logger -t battery-dimmer "Suspend/Resume detected on $bl_name. Re-applying dim."
-                            echo "$TARGET_BRIGHTNESS" > "$bl/brightness" 2>/dev/null
+                            # Likely a resume that reset brightness to max
+                            if echo "$target" > "$bl/brightness" 2>/dev/null; then
+                                log_msg "Suspend/resume detected on $bl_name. Re-applying dim."
+                            fi
                         else
-                            rm -f "$state_file"
-                            touch "$override_file"
-                            logger -t battery-dimmer "User set 100%. Releasing control."
+                            # User set to max — release control until next power cycle
+                            unset 'MEM_ORIGINAL[$bl]'
+                            OVERRIDES[$bl_name]=1
+                            rm -f "$STATE_DIR/$bl_name"
+                            log_msg "User set max brightness on $bl_name. Releasing control."
                         fi
                     else
-                        rm -f "$state_file"
-                        touch "$override_file"
-                        logger -t battery-dimmer "Manual override on $bl_name. Releasing control."
+                        # User changed brightness manually — release control
+                        unset 'MEM_ORIGINAL[$bl]'
+                        OVERRIDES[$bl_name]=1
+                        rm -f "$STATE_DIR/$bl_name"
+                        log_throttled "$bl_name" "Manual override on $bl_name. Releasing control."
                     fi
                 fi
             fi
         done
 
+    # === RESTORE PATH: charging or battery above threshold ===
     elif [[ "$GLOBAL_POWER_STATE" == "charging" ]] || (( GLOBAL_BAT_PERCENT > THRESHOLD )); then
         for bl in "${VALID_BACKLIGHTS[@]}"; do
             bl_name="${bl##*/}"
-            state_file="$STATE_DIR/$bl_name"
-            override_file="$STATE_DIR/${bl_name}.override"
 
-            if [[ -f "$state_file" ]]; then
-                read_sysfs_int "$state_file" ORIGINAL_SAVED
+            # Restore brightness if we dimmed it
+            if [[ -n "${MEM_ORIGINAL[$bl]}" ]]; then
+                ORIGINAL_SAVED=${MEM_ORIGINAL[$bl]}
+                CURRENT_BRIGHTNESS=0
                 read_sysfs_int "$bl/brightness" CURRENT_BRIGHTNESS
-                read_sysfs_int "$bl/max_brightness" MAX_BRIGHTNESS
-                
-                DIMMED_SET=$(( ORIGINAL_SAVED - (ORIGINAL_SAVED * DIM_BY_PERCENT / 100) ))
-                MIN_BRIGHTNESS=$(( MAX_BRIGHTNESS * MIN_PERCENT / 100 ))
-                (( MIN_BRIGHTNESS <= 0 )) && MIN_BRIGHTNESS=1
-                (( DIMMED_SET < MIN_BRIGHTNESS )) && DIMMED_SET=$MIN_BRIGHTNESS
 
-                is_within_tolerance "$CURRENT_BRIGHTNESS" "$DIMMED_SET" "$MAX_BRIGHTNESS" IN_TOLERANCE
-                if (( IN_TOLERANCE == 1 )) && [[ -w "$bl/brightness" ]]; then
-                    echo "$ORIGINAL_SAVED" > "$bl/brightness" 2>/dev/null
-                    logger -t battery-dimmer "Restored $bl_name to original brightness."
+                # Where *we* set it to (the dimmed value)
+                DIMMED_SET=$(compute_dim_target "$ORIGINAL_SAVED" "$bl")
+                diff=$(( CURRENT_BRIGHTNESS - DIMMED_SET ))
+                (( diff < 0 )) && diff=$(( -diff ))
+
+                if (( diff <= BL_TOLERANCE[$bl] )); then
+                    # Brightness is still at our dimmed value — restore it
+                    if echo "$ORIGINAL_SAVED" > "$bl/brightness" 2>/dev/null; then
+                        log_msg "Restored $bl_name to original brightness (${ORIGINAL_SAVED})."
+                    fi
                 else
-                    logger -t battery-dimmer "Override detected on $bl_name. Keeping current brightness."
+                    # User changed it during dim — don't fight them
+                    log_throttled "$bl_name" "Override detected on $bl_name. Keeping current brightness."
                 fi
-                rm -f "$state_file"
+                unset 'MEM_ORIGINAL[$bl]'
+                rm -f "$STATE_DIR/$bl_name"
             fi
-            
-            if [[ -f "$override_file" ]]; then
-                rm -f "$override_file"
-                logger -t battery-dimmer "Cleared override for $bl_name."
+
+            # Clear stale override flags so we re-engage on next low-battery event
+            if [[ ${OVERRIDES[$bl_name]} == 1 ]]; then
+                unset 'OVERRIDES[$bl_name]'
+                log_throttled "$bl_name" "Cleared override for $bl_name."
             fi
         done
     fi
 
-    sleep 10 & wait $!
+    # Zero-fork sleep: blocks on poll() internally
+    read -t "$POLL_INTERVAL" -u 8 || true
 done
