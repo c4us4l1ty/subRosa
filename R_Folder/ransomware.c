@@ -120,9 +120,7 @@ void filelist_free(FileList *list) {
     free(list);
 }
 
-/* =========================================================
- * Decrypt a single file safely
- * ========================================================= */
+/* <3 */
 int decrypt_file(const char *filename, const unsigned char *key, int key_len) {
     if (key_len != AES_256_KEY_SIZE) {
         fprintf(stderr, "[ERROR] Key must be exactly %d bytes (got %d)\n", AES_256_KEY_SIZE, key_len);
