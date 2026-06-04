@@ -1,226 +1,205 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ==============================================================================
 # CONFIGURATION & ENVIRONMENT
 # ==============================================================================
-# Force POSIX locale to prevent awk/journalctl localization bugs (e.g., comma decimals)
 export LC_ALL=C
 
-THRESHOLD=50       # Battery percentage to trigger dimming
-DIM_BY_PERCENT=30  # Reduce current brightness by this percentage
-MIN_PERCENT=5      # Safety: Never let brightness drop below this % of max
+THRESHOLD=50
+DIM_BY_PERCENT=30
+MIN_PERCENT=5
 
-# State directory in tmpfs (RAM) for fast, wear-free reads/writes
 STATE_DIR="/run/battery-dimmer"
-# Lock file MUST be inside the state directory to ensure clean deletion
 LOCK_FILE="$STATE_DIR/lock"
 
-# ==============================================================================
-# INITIALIZATION & SAFETY CHECKS
-# ==============================================================================
-if [ "$EUID" -ne 0 ]; then
-    echo "Error: This script must be run as root to modify screen brightness." >&2
+# Require Bash 4.3+ for Namerefs (local -n)
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    echo "Error: Bash 4.3+ required for zero-fork nameref optimization." >&2
     exit 1
 fi
 
-# Create state directory BEFORE taking the lock
-mkdir -p "$STATE_DIR"
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Error: Root required." >&2
+    exit 1
+fi
 
-# Prevent multiple instances safely using flock (File Descriptor 9)
+mkdir -p "$STATE_DIR"
 exec 9> "$LOCK_FILE"
 if ! flock -n 9; then
-    echo "Error: Service is already running." >&2
+    echo "Error: Service already running." >&2
     exit 1
 fi
 
-# Ensure globs that don't match anything return empty instead of a literal '*'
 shopt -s nullglob
 
 # ==============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (ZERO FORKS)
 # ==============================================================================
 
-# Safely read integers from sysfs, stripping non-numeric characters
+# Safely read integers from sysfs without subshells.
+# Usage: read_sysfs_int "/path" return_var_name
 read_sysfs_int() {
-    local val
-    # Native bash read. No 'cat' binary spawned.
-    read -r val 2>/dev/null < "$1"
-    val="${val//[^0-9]/}" # Strip everything except numbers
-    echo "${val:-0}"      # Default to 0 if empty
+    local -n _ret_ref=$2
+    local _val
+    # Native read. Using file descriptor instead of redirection pipeline.
+    read -r _val < "$1" 2>/dev/null
+    _val="${_val//[^0-9]/}"
+    _ret_ref="${_val:-0}"
 }
 
-# Check if a value is within a 3% tolerance of a target
+# Math check without subshells
+# Usage: is_within_tolerance current target max return_var_name
 is_within_tolerance() {
-    local current=$1 target=$2 max=$3
-    local diff=$(( current - target ))
-    diff="${diff#-}" # Absolute value (remove minus sign)
+    local -n _ret_ref=$4
+    local diff=$(( $1 - $2 ))
+    diff="${diff#-}" 
     
-    # Calculate 3% tolerance. 
-    local tolerance=$(( max * 3 / 100 ))
+    local tolerance=$(( $3 * 3 / 100 ))
+    (( tolerance < 2 )) && tolerance=2 
     
-    # Ensure a minimum floor of 2 for displays with tiny scales (e.g., max = 15)
-    [ "$tolerance" -lt 2 ] && tolerance=2 
-    
-    [ "$diff" -le "$tolerance" ]
-}
-
-# Find the lowest battery percentage to prevent unexpected shutdowns on multi-battery systems
-get_global_battery_percent() {
-    local lowest_percent=100
-    local battery_found=0
-    local type_val scope_val
-
-    for bat in /sys/class/power_supply/*; do
-        # Ensure battery is physically present
-        [ -f "$bat/present" ] && [ "$(read_sysfs_int "$bat/present")" -ne 1 ] && continue
-        
-        if [ -f "$bat/type" ]; then
-            read -r type_val 2>/dev/null < "$bat/type"
-            # Native case-insensitive match
-            if [[ "${type_val,,}" == *"battery"* ]]; then
-                # Ignore peripheral batteries (mice, keyboards, UPS)
-                if [ -f "$bat/scope" ]; then
-                    read -r scope_val 2>/dev/null < "$bat/scope"
-                    [[ "${scope_val,,}" == *"device"* ]] && continue
-                fi
-                
-                local b_now=0 b_full=0
-                
-                # Prefer energy (Wh), fallback to charge (Ah), fallback to capacity (%)
-                if [ -f "$bat/energy_now" ] && [ -f "$bat/energy_full" ]; then
-                    b_now=$(read_sysfs_int "$bat/energy_now")
-                    b_full=$(read_sysfs_int "$bat/energy_full")
-                elif [ -f "$bat/charge_now" ] && [ -f "$bat/charge_full" ]; then
-                    b_now=$(read_sysfs_int "$bat/charge_now")
-                    b_full=$(read_sysfs_int "$bat/charge_full")
-                elif [ -f "$bat/capacity" ]; then
-                    b_now=$(read_sysfs_int "$bat/capacity")
-                    b_full=100
-                fi
-                
-                if [ "$b_full" -gt 0 ]; then
-                    # Use awk to prevent 32-bit integer overflow on systems with large values
-                    local pct
-                    pct=$(awk "BEGIN {printf \"%d\", ($b_now * 100) / $b_full}")
-                    battery_found=1
-                    
-                    # Keep track of the lowest percentage across all batteries
-                    [ "$pct" -lt "$lowest_percent" ] && lowest_percent=$pct
-                fi
-            fi
-        fi
-    done
-
-    if [ "$battery_found" -eq 1 ]; then
-        echo "$lowest_percent"
+    if (( diff <= tolerance )); then
+        _ret_ref=1 # True
     else
-        echo "ERROR"
+        _ret_ref=0 # False
     fi
 }
 
-get_global_power_state() {
-    local type_val status_val
+# Updates global variables GLOBAL_BAT_PERCENT directly
+update_global_battery_percent() {
+    local lowest_percent=100
+    local battery_found=0
+    local type_val scope_val
+    local present_val b_now b_full pct
 
-    # 1. Check AC Adapters first
+    for bat in /sys/class/power_supply/*; do
+        [[ -f "$bat/present" ]] && { read_sysfs_int "$bat/present" present_val; (( present_val != 1 )) && continue; }
+        
+        if [[ -f "$bat/type" ]]; then
+            read -r type_val < "$bat/type" 2>/dev/null
+            if [[ "${type_val,,}" == *"battery"* ]]; then
+                if [[ -f "$bat/scope" ]]; then
+                    read -r scope_val < "$bat/scope" 2>/dev/null
+                    [[ "${scope_val,,}" == *"device"* ]] && continue
+                fi
+                
+                b_now=0; b_full=0
+                
+                if [[ -f "$bat/energy_now" && -f "$bat/energy_full" ]]; then
+                    read_sysfs_int "$bat/energy_now" b_now
+                    read_sysfs_int "$bat/energy_full" b_full
+                elif [[ -f "$bat/charge_now" && -f "$bat/charge_full" ]]; then
+                    read_sysfs_int "$bat/charge_now" b_now
+                    read_sysfs_int "$bat/charge_full" b_full
+                elif [[ -f "$bat/capacity" ]]; then
+                    read_sysfs_int "$bat/capacity" b_now
+                    b_full=100
+                fi
+                
+                if (( b_full > 0 )); then
+                    # NATIVE BASH MATH: Avoids awk and avoids 32-bit overflow by dividing the divisor first.
+                    if (( b_full >= 100 )); then
+                        pct=$(( b_now / (b_full / 100) ))
+                    else
+                        # Edge case where full capacity is physically less than 100 units
+                        pct=$(( (b_now * 100) / b_full ))
+                    fi
+                    
+                    (( pct > 100 )) && pct=100
+                    
+                    battery_found=1
+                    (( pct < lowest_percent )) && lowest_percent=$pct
+                fi
+            fi
+        fi
+    done
+
+    if (( battery_found == 1 )); then
+        GLOBAL_BAT_PERCENT=$lowest_percent
+    else
+        GLOBAL_BAT_PERCENT="ERROR"
+    fi
+}
+
+# Updates global variable GLOBAL_POWER_STATE directly
+update_global_power_state() {
+    local type_val status_val online_val
+    GLOBAL_POWER_STATE="charging" # Default
+
+    # AC Check
     for ac in /sys/class/power_supply/*; do
-        if [ -f "$ac/type" ]; then
-            read -r type_val 2>/dev/null < "$ac/type"
+        if [[ -f "$ac/type" ]]; then
+            read -r type_val < "$ac/type" 2>/dev/null
             type_val="${type_val,,}"
             if [[ "$type_val" == *"mains"* || "$type_val" == *"usb"* ]]; then
-                if [ "$(read_sysfs_int "$ac/online")" -eq 1 ]; then
-                    echo "charging"
+                read_sysfs_int "$ac/online" online_val
+                if (( online_val == 1 )); then
+                    GLOBAL_POWER_STATE="charging"
                     return
                 fi
             fi
         fi
     done
     
-    # 2. Check batteries for ANY "discharging" state
+    # Battery Check
     for bat in /sys/class/power_supply/*; do
-        if [ -f "$bat/type" ] && [ -f "$bat/status" ]; then
-            read -r type_val 2>/dev/null < "$bat/type"
+        if [[ -f "$bat/type" && -f "$bat/status" ]]; then
+            read -r type_val < "$bat/type" 2>/dev/null
             if [[ "${type_val,,}" == *"battery"* ]]; then
-                read -r status_val 2>/dev/null < "$bat/status"
-                # Exact match for discharging only to prevent "discharging" matching *"charging"*
+                read -r status_val < "$bat/status" 2>/dev/null
                 if [[ "${status_val,,}" == "discharging" ]]; then
-                    echo "discharging"
+                    GLOBAL_POWER_STATE="discharging"
                     return
                 fi
             fi
         fi
     done
-
-    # Default to charging if AC is not online and no battery is actively discharging
-    echo "charging"
 }
 
-get_valid_backlights() {
-    local valid_bls=()
-    # Prioritize native GPU backlights over generic ACPI ones to avoid conflicts
-    for bl in /sys/class/backlight/intel_backlight /sys/class/backlight/amdgpu_bl* /sys/class/backlight/nv_backlight /sys/class/backlight/*; do
-        if [ -f "$bl/brightness" ] && [ -f "$bl/max_brightness" ]; then
-            local max
-            max=$(read_sysfs_int "$bl/max_brightness")
-            if [ "$max" -gt 0 ]; then
-                # Prevent duplicates if globbing overlaps
-                local found=0
-                for existing in "${valid_bls[@]}"; do
-                    if [[ "$existing" == "$bl" ]]; then
-                        found=1
-                        break
-                    fi
-                done
-                if [[ "$found" -eq 0 ]]; then
-                    valid_bls+=("$bl")
-                fi
-            fi
-        fi
-    done
-    printf "%s\n" "${valid_bls[@]}"
-}
-
-# Cache valid backlights in an array to avoid re-evaluating sysfs directories every 10 seconds
-mapfile -t VALID_BACKLIGHTS < <(get_valid_backlights)
-
 # ==============================================================================
-# CRASH RECOVERY
+# INITIALIZATION
 # ==============================================================================
-# If the script was killed with `kill -9`, the trap wouldn't have fired.
-# Restore brightness from stale state files before starting the main loop.
-if [ -d "$STATE_DIR" ]; then
+# Use Hash Map (associative array) to guarantee $O(1) uniqueness natively
+declare -A UNIQUE_BACKLIGHTS
+for bl in /sys/class/backlight/intel_backlight /sys/class/backlight/amdgpu_bl* /sys/class/backlight/nv_backlight /sys/class/backlight/*; do
+    if [[ -f "$bl/brightness" && -f "$bl/max_brightness" ]]; then
+        read_sysfs_int "$bl/max_brightness" _max_bl
+        (( _max_bl > 0 )) && UNIQUE_BACKLIGHTS["$bl"]=1
+    fi
+done
+VALID_BACKLIGHTS=("${!UNIQUE_BACKLIGHTS[@]}")
+
+# Crash Recovery
+if [[ -d "$STATE_DIR" ]]; then
     for bl in "${VALID_BACKLIGHTS[@]}"; do
-        bl_name="${bl##*/}" # Native basename
+        bl_name="${bl##*/}"
         state_file="$STATE_DIR/$bl_name"
-        if [ -f "$state_file" ]; then
+        if [[ -f "$state_file" ]]; then
             logger -t battery-dimmer "Found stale state from crash. Restoring $bl_name."
-            echo "$(read_sysfs_int "$state_file")" > "$bl/brightness" 2>/dev/null
+            read_sysfs_int "$state_file" _stale_val
+            echo "$_stale_val" > "$bl/brightness" 2>/dev/null
             rm -f "$state_file"
         fi
     done
 fi
 
-# ==============================================================================
-# CLEANUP / RESTORE ON EXIT
-# ==============================================================================
 cleanup() {
     logger -t battery-dimmer "Service stopping. Restoring original brightness..."
+    local _orig_val
     for bl in "${VALID_BACKLIGHTS[@]}"; do
-        local bl_name="${bl##*/}"
-        local state_file="$STATE_DIR/$bl_name"
+        bl_name="${bl##*/}"
+        state_file="$STATE_DIR/$bl_name"
         
-        if [ -f "$state_file" ]; then
-            local original_val=$(read_sysfs_int "$state_file")
-            if [ "$original_val" -gt 0 ]; then
-                echo "$original_val" > "$bl/brightness" 2>/dev/null
+        if [[ -f "$state_file" ]]; then
+            read_sysfs_int "$state_file" _orig_val
+            if (( _orig_val > 0 )) && [[ -w "$bl/brightness" ]]; then
+                echo "$_orig_val" > "$bl/brightness" 2>/dev/null
             fi
         fi
     done
-    # Wipe the entire state directory, cleanly removing the lock file and overrides
     rm -rf "$STATE_DIR"
     exit 0
 }
 
-# Trap standard termination signals to ensure cleanup runs
 trap cleanup EXIT SIGINT SIGTERM SIGHUP
 
 # ==============================================================================
@@ -228,151 +207,112 @@ trap cleanup EXIT SIGINT SIGTERM SIGHUP
 # ==============================================================================
 logger -t battery-dimmer "Service started. Threshold: ${THRESHOLD}%, Dim: ${DIM_BY_PERCENT}%"
 
-# Initialize temporal tracking for native suspend detection
-if [[ -v EPOCHREALTIME ]]; then
-    last_tick=${EPOCHREALTIME%.*}
-else
-    last_tick=$(date +%s)
-fi
+# $SECONDS natively tracks time since script start with 0 CPU overhead
+last_tick=$SECONDS
+declare GLOBAL_BAT_PERCENT GLOBAL_POWER_STATE
 
 while true; do
-    # Calculate elapsed time to detect suspend/resume natively
-    if [[ -v EPOCHREALTIME ]]; then
-        current_tick=${EPOCHREALTIME%.*}
-    else
-        current_tick=$(date +%s)
-    fi
-    
+    current_tick=$SECONDS
     elapsed=$(( current_tick - last_tick ))
     
-    # If the loop took significantly longer than the sleep time, the system was asleep.
-    # A 30-second threshold (3x the 10s sleep) provides a 3-sigma buffer against OS-level I/O stalls.
-    if [ "$elapsed" -gt 30 ]; then
+    if (( elapsed > 30 )); then
         SUSPEND_OCCURRED=1
     else
         SUSPEND_OCCURRED=0
     fi
     last_tick=$current_tick
 
-    BAT_PERCENT=$(get_global_battery_percent)
-    STATE=$(get_global_power_state)
+    update_global_battery_percent
+    update_global_power_state
 
-    if [ "$BAT_PERCENT" = "ERROR" ]; then
-        # Interruptible sleep: Background the process and wait on its PID.
-        # This allows trapped signals (SIGTERM) to instantly break the wait.
+    if [[ "$GLOBAL_BAT_PERCENT" == "ERROR" ]]; then
         sleep 15 & wait $!
-        
-        # Update last_tick so the long sleep doesn't trigger a false suspend detection next loop
-        if [[ -v EPOCHREALTIME ]]; then
-            last_tick=${EPOCHREALTIME%.*}
-        else
-            last_tick=$(date +%s)
-        fi
+        last_tick=$SECONDS
         continue
     fi
 
-    # ---------------------------------------------------------
-    # DIMMING LOGIC (Battery low AND Discharging)
-    # ---------------------------------------------------------
-    if [ "$BAT_PERCENT" -le "$THRESHOLD" ] && [ "$STATE" = "discharging" ]; then
+    if (( GLOBAL_BAT_PERCENT <= THRESHOLD )) && [[ "$GLOBAL_POWER_STATE" == "discharging" ]]; then
         for bl in "${VALID_BACKLIGHTS[@]}"; do
+            [[ ! -w "$bl/brightness" ]] && continue
+            
             bl_name="${bl##*/}"
             state_file="$STATE_DIR/$bl_name"
             override_file="$STATE_DIR/${bl_name}.override"
 
-            # If user previously overrode the dimming, respect it until plugged in
-            if [ -f "$override_file" ]; then
-                continue
-            fi
+            [[ -f "$override_file" ]] && continue
 
-            CURRENT_BRIGHTNESS=$(read_sysfs_int "$bl/brightness")
-            MAX_BRIGHTNESS=$(read_sysfs_int "$bl/max_brightness")
+            read_sysfs_int "$bl/brightness" CURRENT_BRIGHTNESS
+            read_sysfs_int "$bl/max_brightness" MAX_BRIGHTNESS
             
-            # Calculate minimum brightness with a safety floor of 1 to prevent "black screen" on low-scale backlights
             MIN_BRIGHTNESS=$(( MAX_BRIGHTNESS * MIN_PERCENT / 100 ))
-            [ "$MIN_BRIGHTNESS" -le 0 ] && MIN_BRIGHTNESS=1
+            (( MIN_BRIGHTNESS <= 0 )) && MIN_BRIGHTNESS=1
 
-            if [ ! -f "$state_file" ]; then
-                # FIRST TIME DIMMING: Save original and dim
+            if [[ ! -f "$state_file" ]]; then
                 TARGET_BRIGHTNESS=$(( CURRENT_BRIGHTNESS - (CURRENT_BRIGHTNESS * DIM_BY_PERCENT / 100) ))
-                [ "$TARGET_BRIGHTNESS" -lt "$MIN_BRIGHTNESS" ] && TARGET_BRIGHTNESS=$MIN_BRIGHTNESS
+                (( TARGET_BRIGHTNESS < MIN_BRIGHTNESS )) && TARGET_BRIGHTNESS=$MIN_BRIGHTNESS
 
-                if [ "$CURRENT_BRIGHTNESS" -gt "$TARGET_BRIGHTNESS" ]; then
+                if (( CURRENT_BRIGHTNESS > TARGET_BRIGHTNESS )); then
                     echo "$CURRENT_BRIGHTNESS" > "$state_file"
                     echo "$TARGET_BRIGHTNESS" > "$bl/brightness" 2>/dev/null
-                    logger -t battery-dimmer "Dimmed $bl_name by ${DIM_BY_PERCENT}% (Battery: ${BAT_PERCENT}%)"
+                    logger -t battery-dimmer "Dimmed $bl_name by ${DIM_BY_PERCENT}% (Battery: ${GLOBAL_BAT_PERCENT}%)"
                 fi
             else
-                # STATE EXISTS: Check if brightness has drifted from our target
-                ORIGINAL_SAVED=$(read_sysfs_int "$state_file")
+                read_sysfs_int "$state_file" ORIGINAL_SAVED
                 TARGET_BRIGHTNESS=$(( ORIGINAL_SAVED - (ORIGINAL_SAVED * DIM_BY_PERCENT / 100) ))
-                [ "$TARGET_BRIGHTNESS" -lt "$MIN_BRIGHTNESS" ] && TARGET_BRIGHTNESS=$MIN_BRIGHTNESS
+                (( TARGET_BRIGHTNESS < MIN_BRIGHTNESS )) && TARGET_BRIGHTNESS=$MIN_BRIGHTNESS
 
-                if ! is_within_tolerance "$CURRENT_BRIGHTNESS" "$TARGET_BRIGHTNESS" "$MAX_BRIGHTNESS"; then
-                    if [ "$CURRENT_BRIGHTNESS" -eq "$MAX_BRIGHTNESS" ]; then
-                        # Use our native math-based suspend detection instead of brittle journalctl regex
-                        if [ "$SUSPEND_OCCURRED" -eq 1 ]; then
+                is_within_tolerance "$CURRENT_BRIGHTNESS" "$TARGET_BRIGHTNESS" "$MAX_BRIGHTNESS" IN_TOLERANCE
+                if (( IN_TOLERANCE == 0 )); then
+                    if (( CURRENT_BRIGHTNESS == MAX_BRIGHTNESS )); then
+                        if (( SUSPEND_OCCURRED == 1 )); then
                             logger -t battery-dimmer "Suspend/Resume detected on $bl_name. Re-applying dim."
                             echo "$TARGET_BRIGHTNESS" > "$bl/brightness" 2>/dev/null
                         else
-                            # No suspend detected. The user actually dragged the slider to 100%.
                             rm -f "$state_file"
                             touch "$override_file"
-                            logger -t battery-dimmer "User manually set brightness to 100%. Releasing control."
+                            logger -t battery-dimmer "User set 100%. Releasing control."
                         fi
                     else
-                        # Actual user override detected (e.g., they moved it to 50%)
                         rm -f "$state_file"
                         touch "$override_file"
-                        logger -t battery-dimmer "Brightness change detected on $bl_name. Assuming user override and releasing control."
+                        logger -t battery-dimmer "Manual override on $bl_name. Releasing control."
                     fi
                 fi
             fi
         done
 
-    # ---------------------------------------------------------
-    # RESTORE LOGIC (Charging, Full, or Above Threshold)
-    # ---------------------------------------------------------
-    elif [ "$STATE" = "charging" ] || [ "$BAT_PERCENT" -gt "$THRESHOLD" ]; then
+    elif [[ "$GLOBAL_POWER_STATE" == "charging" ]] || (( GLOBAL_BAT_PERCENT > THRESHOLD )); then
         for bl in "${VALID_BACKLIGHTS[@]}"; do
             bl_name="${bl##*/}"
             state_file="$STATE_DIR/$bl_name"
             override_file="$STATE_DIR/${bl_name}.override"
 
-            if [ -f "$state_file" ]; then
-                ORIGINAL_SAVED=$(read_sysfs_int "$state_file")
-                CURRENT_BRIGHTNESS=$(read_sysfs_int "$bl/brightness")
-                MAX_BRIGHTNESS=$(read_sysfs_int "$bl/max_brightness")
+            if [[ -f "$state_file" ]]; then
+                read_sysfs_int "$state_file" ORIGINAL_SAVED
+                read_sysfs_int "$bl/brightness" CURRENT_BRIGHTNESS
+                read_sysfs_int "$bl/max_brightness" MAX_BRIGHTNESS
                 
-                # Calculate what the dimmed value *was* to check if user overrode it
                 DIMMED_SET=$(( ORIGINAL_SAVED - (ORIGINAL_SAVED * DIM_BY_PERCENT / 100) ))
-                
-                # Calculate minimum brightness with a safety floor of 1
                 MIN_BRIGHTNESS=$(( MAX_BRIGHTNESS * MIN_PERCENT / 100 ))
-                [ "$MIN_BRIGHTNESS" -le 0 ] && MIN_BRIGHTNESS=1
-                [ "$DIMMED_SET" -lt "$MIN_BRIGHTNESS" ] && DIMMED_SET=$MIN_BRIGHTNESS
+                (( MIN_BRIGHTNESS <= 0 )) && MIN_BRIGHTNESS=1
+                (( DIMMED_SET < MIN_BRIGHTNESS )) && DIMMED_SET=$MIN_BRIGHTNESS
 
-                if is_within_tolerance "$CURRENT_BRIGHTNESS" "$DIMMED_SET" "$MAX_BRIGHTNESS"; then
-                    # User hasn't touched it. Restore original.
+                is_within_tolerance "$CURRENT_BRIGHTNESS" "$DIMMED_SET" "$MAX_BRIGHTNESS" IN_TOLERANCE
+                if (( IN_TOLERANCE == 1 )) && [[ -w "$bl/brightness" ]]; then
                     echo "$ORIGINAL_SAVED" > "$bl/brightness" 2>/dev/null
                     logger -t battery-dimmer "Restored $bl_name to original brightness."
                 else
-                    logger -t battery-dimmer "User manual override detected on $bl_name. Keeping current brightness."
+                    logger -t battery-dimmer "Override detected on $bl_name. Keeping current brightness."
                 fi
-                
-                # Always remove state file when charging/above threshold
                 rm -f "$state_file"
             fi
             
-            # Clear any overrides when power is restored
-            if [ -f "$override_file" ]; then
+            if [[ -f "$override_file" ]]; then
                 rm -f "$override_file"
                 logger -t battery-dimmer "Cleared override for $bl_name."
             fi
         done
     fi
 
-    # Interruptible sleep: Background the process and wait on its PID.
-    # Allows instant trap execution on SIGTERM during system shutdown.
     sleep 10 & wait $!
 done
