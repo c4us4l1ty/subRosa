@@ -3,7 +3,6 @@
 # battery-dimmer.sh — Ultra-optimized, zero-fork polling battery-aware backlight dimmer.
 # Hardened for arbitrary arithmetic injection, race conditions, and sysfs quirks.
 
-# ==============================================================================
 # STRICT MODE & PARSER SETTINGS
 # ==============================================================================
 set -uo pipefail
@@ -15,7 +14,6 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) ))
     exit 1
 fi
 
-# ==============================================================================
 # CONFIGURATION & INJECTION PREVENTION
 # ==============================================================================
 # Fallbacks
@@ -42,7 +40,6 @@ readonly THRESHOLD DIM_BY_PERCENT MIN_PERCENT SUSPEND_THRESHOLD POLL_INTERVAL LO
 (( POLL_INTERVAL >= 1 ))                          || exit 1
 (( SUSPEND_THRESHOLD > 2 ))                       || exit 1
 
-# ==============================================================================
 # PATHS & ROBUST INITIALIZATION
 # ==============================================================================
 readonly SYSFS_BL="/sys/class/backlight"
