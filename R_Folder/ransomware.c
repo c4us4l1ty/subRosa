@@ -133,7 +133,6 @@ int decrypt_file(const char *filename, const unsigned char *key, int key_len) {
         return 0;
     }
 
-    /* Get file size safely */
     if (fseek(in_file, 0, SEEK_END) != 0) {
         fprintf(stderr, "[ERROR] fseek failed on '%s'\n", filename);
         fclose(in_file);
@@ -155,7 +154,6 @@ int decrypt_file(const char *filename, const unsigned char *key, int key_len) {
         return 0;
     }
 
-    /* Read IV */
     unsigned char iv[AES_BLOCK_SIZE];
     if (fread(iv, 1, AES_BLOCK_SIZE, in_file) != AES_BLOCK_SIZE) {
         fprintf(stderr, "[ERROR] Failed to read IV from '%s'\n", filename);
@@ -187,7 +185,6 @@ int decrypt_file(const char *filename, const unsigned char *key, int key_len) {
         return 0;
     }
 
-    /* Allocate plaintext buffer with padding room */
     unsigned char *plaintext = malloc(cipher_size + EVP_MAX_BLOCK_LENGTH);
     if (!plaintext) {
         fprintf(stderr, "[ERROR] Memory allocation failed for plaintext buffer.\n");
@@ -221,16 +218,12 @@ int decrypt_file(const char *filename, const unsigned char *key, int key_len) {
 
     if (EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len) != 1) {
         fprintf(stderr, "[ERROR] Decryption failed for '%s'. Incorrect key or corrupted data.\n", filename);
-        /* Clear internal OpenSSL error queue so subsequent runs aren't polluted */
         ERR_clear_error();
         success = 0;
         goto cleanup;
     }
     plaintext_len += len;
 
-    /* 
-     * Safe Write: Ensure the temp filename construction does not truncate
-     */
     char tmp_filename[MAX_PATH_LEN];
     int printed = snprintf(tmp_filename, sizeof(tmp_filename), "%s.tmp", filename);
     if (printed < 0 || (size_t)printed >= sizeof(tmp_filename)) {
@@ -256,7 +249,6 @@ int decrypt_file(const char *filename, const unsigned char *key, int key_len) {
         goto cleanup;
     }
 
-    /* Replace original file with decrypted content */
     if (rename(tmp_filename, filename) != 0) {
         fprintf(stderr, "[ERROR] Failed to replace original file with decrypted content.\n");
         remove(tmp_filename);
@@ -270,7 +262,6 @@ cleanup:
     EVP_CIPHER_CTX_free(ctx);
     free(cipher);
     
-    /* Cleanse decrypted data before freeing */
     if (plaintext) {
         OPENSSL_cleanse(plaintext, cipher_size + EVP_MAX_BLOCK_LENGTH);
         free(plaintext);
@@ -278,9 +269,6 @@ cleanup:
     return success;
 }
 
-/* =========================================================
- * Collect files from current directory
- * ========================================================= */
 FileList *collect_files(const char **exclude_list, int exclude_count) {
     DIR *dir = opendir(".");
     if (!dir) {
@@ -323,9 +311,6 @@ FileList *collect_files(const char **exclude_list, int exclude_count) {
     return list;
 }
 
-/* =========================================================
- * Load key from file securely
- * ========================================================= */
 unsigned char *load_key(const char *key_filename, int *key_len) {
     if (!file_exists(key_filename)) {
         fprintf(stderr, "[ERROR] Key file '%s' not found.\n", key_filename);
@@ -373,9 +358,6 @@ unsigned char *load_key(const char *key_filename, int *key_len) {
     return key;
 }
 
-/* =========================================================
- * Main Entry Point
- * ========================================================= */
 int main(void) {
     const char *exclude_files[] = {
         "exploit.py",
@@ -432,12 +414,10 @@ int main(void) {
         return 1;
     }
 
-    /* Wipe the plain-text secret phrase as soon as it is verified */
     OPENSSL_cleanse(user_phrase, sizeof(user_phrase));
 
     printf("[OK] Phrase accepted. Starting decryption...\n\n");
 
-    /* Initialize OpenSSL configuration */
     OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG |
                         OPENSSL_INIT_ADD_ALL_CIPHERS |
                         OPENSSL_INIT_ADD_ALL_DIGESTS, NULL);
@@ -459,7 +439,6 @@ int main(void) {
     printf("  Failed     : %d\n", fail_count);
     printf("========================================\n");
 
-    /* Securely clear and free key */
     OPENSSL_cleanse(secret_key, key_len);
     free(secret_key);
     filelist_free(files);
