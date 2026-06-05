@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-#
 # battery-dimmer.sh — Ultra-optimized, zero-fork polling battery-aware backlight dimmer.
 # Hardened for arbitrary arithmetic injection, race conditions, and sysfs quirks.
 
