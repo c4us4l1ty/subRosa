@@ -3,7 +3,6 @@
 # Hardened for arbitrary arithmetic injection, race conditions, and sysfs quirks.
 
 # STRICT MODE & PARSER SETTINGS
-# ==============================================================================
 set -uo pipefail
 shopt -s nullglob extglob
 
@@ -14,7 +13,6 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) ))
 fi
 
 # CONFIGURATION & INJECTION PREVENTION
-# ==============================================================================
 # Fallbacks
 : "${THRESHOLD:=50}"
 : "${DIM_BY_PERCENT:=30}"
