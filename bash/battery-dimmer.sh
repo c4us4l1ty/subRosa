@@ -23,20 +23,22 @@ fi
 : "${SUSPEND_THRESHOLD:=10}"
 : "${LOG_THROTTLE:=30}"
 : "${RESCAN_EVERY:=10}"
+: "${UDEV_DEBOUNCE:=2}" # Seconds to wait for flapping hardware to settle
 
 # Strict 6-digit upper bound prevents arbitrary user input from overflowing Bash's 64-bit integer limits
-for _var in THRESHOLD DIM_BY_PERCENT MIN_PERCENT BASE_POLL_INTERVAL SUSPEND_THRESHOLD LOG_THROTTLE RESCAN_EVERY; do
+for _var in THRESHOLD DIM_BY_PERCENT MIN_PERCENT BASE_POLL_INTERVAL SUSPEND_THRESHOLD LOG_THROTTLE RESCAN_EVERY UDEV_DEBOUNCE; do
     [[ "${!_var}" =~ ^0*[0-9]{1,6}$ ]] || { echo "Fatal: $_var must be a positive integer <= 999999." >&2; exit 1; }
     printf -v "$_var" '%d' "$(( 10#${!_var} ))"
 done
 unset _var
 
-readonly THRESHOLD DIM_BY_PERCENT MIN_PERCENT BASE_POLL_INTERVAL SUSPEND_THRESHOLD LOG_THROTTLE RESCAN_EVERY
+readonly THRESHOLD DIM_BY_PERCENT MIN_PERCENT BASE_POLL_INTERVAL SUSPEND_THRESHOLD LOG_THROTTLE RESCAN_EVERY UDEV_DEBOUNCE
 
 (( THRESHOLD >= 0 && THRESHOLD <= 100 ))          || exit 1
 (( DIM_BY_PERCENT > 0 && DIM_BY_PERCENT <= 100 )) || exit 1
 (( MIN_PERCENT >= 0 && MIN_PERCENT < 100 ))       || exit 1
 (( BASE_POLL_INTERVAL >= 10 ))                    || exit 1
+(( UDEV_DEBOUNCE >= 1 && UDEV_DEBOUNCE <= 60 ))   || exit 1
 
 # ==============================================================================
 # PATHS, TOCTOU-SAFE INITIALIZATION, & UDEV DEADLOCK PREVENTION
@@ -385,25 +387,35 @@ scan_backlights
 scan_power_supplies
 log_msg "Started. Threshold=${THRESHOLD}%, Dim=${DIM_BY_PERCENT}%, Max Polling=${BASE_POLL_INTERVAL}s."
 
-while true; do
-    # Drain udev queue signal cleanly without blocking
-    while read -t 0 -u 8; do 
-        read -r -t 0.05 -u 8 _ || break
-    done
+# Drain any stale startup events before entering the loop
+while read -t 0 -u 8; do read -r -t 0.05 -u 8 _ || break; done
 
-    # Sleep until timeout or instant interrupt from Udev pipe
-    read -t "$CURRENT_POLL_INTERVAL" -r -u 8 _ || true
+while true; do
+    # Sleep until timeout or instant interrupt from Udev pipe.
+    # 'read' returns 0 if it successfully read data (udev event).
+    # It returns >0 if it timed out.
+    if read -t "$CURRENT_POLL_INTERVAL" -r -u 8 _; then
+        # UDEV EVENT DETECTED
+        # Debounce: Sleep to allow flapping hardware (e.g., loose charging cables) 
+        # to settle. The kernel will buffer rapid-fire events in the FIFO during this time.
+        zero_fork_sleep "$UDEV_DEBOUNCE"
+        
+        # Drain the accumulated flapping signals cleanly without blocking
+        while read -t 0 -u 8; do 
+            read -r -t 0.05 -u 8 _ || break
+        done
+    fi
 
     get_uptime
-    local_now=$UPTIME_REPLY
-    drift=$(( local_now - LAST_TICK ))
+    NOW_TICK=$UPTIME_REPLY
+    drift=$(( NOW_TICK - LAST_TICK ))
     
     if (( drift > CURRENT_POLL_INTERVAL + SUSPEND_THRESHOLD )); then
         log_msg "Suspend/resume detected (drift=${drift}s). Forcing hardware rescan."
         scan_backlights
         scan_power_supplies
     fi
-    LAST_TICK=$local_now
+    LAST_TICK=$NOW_TICK
 
     (( ++WAKEUP_COUNT % RESCAN_EVERY == 0 )) && { scan_backlights; scan_power_supplies; }
 
