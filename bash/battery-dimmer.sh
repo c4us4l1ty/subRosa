@@ -56,7 +56,7 @@ readonly UDEV_RULE="/etc/udev/rules.d/99-battery-dimmer.rules"
 export LC_ALL=C
 (( EUID == 0 )) || { echo "Fatal: Root required." >&2; exit 1; }
 
-# UDEV Deadlock-Immune Installation (FIXED: Uses flock check to prevent zombie writers)
+# UDEV Deadlock-Immune Installation
 if [[ "${1:-}" == "--install-udev" ]]; then
     cat <<EOF > "$UDEV_RULE"
 # Wake up battery-dimmer. Non-blocking & immune to process starvation when daemon is stopped.
@@ -98,9 +98,9 @@ exec 9> "$LOCK_FILE"
 # Secure the lock FIRST before setting traps, protecting against multi-instance collisions
 flock -n 9 || { echo "Fatal: Already running. Lock held by another instance." >&2; exit 1; }
 
-# Safe Array Expansion definitions for Bash < 4.4 compatibility under 'set -u'
+# Safe Array expansions; separated declaration and initialization for Bash < 4.4 compat
 declare -g -a BACKLIGHTS=() POWER_SUPPLIES=() PS_KIND=() PS_SCOPE=()
-declare -g -A BL_MAX=() BL_MIN=() BL_TOL=() BL_ORIG=() BL_TARGET=() BL_OVERRIDE=() BL_DIMMED=() LOG_LAST=()
+declare -g -A BL_MAX BL_MIN BL_TOL BL_ORIG BL_TARGET BL_OVERRIDE BL_DIMMED LOG_LAST
 
 cleanup() {
     trap '' EXIT SIGINT SIGTERM SIGHUP SIGQUIT 
@@ -110,18 +110,17 @@ cleanup() {
     log_msg "Stopping daemon. Restoring backlight states..."
     
     if (( ${#BACKLIGHTS[@]} > 0 )); then
-        # FIXED: Safe array expansions to prevent crashes on older Bash versions
-        for bl in ${BACKLIGHTS[@]+"${BACKLIGHTS[@]}"}; do
+        for bl in "${BACKLIGHTS[@]}"; do
             if [[ "${BL_DIMMED["$bl"]:-0}" == "1" && -n "${BL_ORIG["$bl"]:-}" ]]; then
                 printf '%s\n' "${BL_ORIG["$bl"]}" > "$bl/brightness" 2>/dev/null
             fi
         done
     fi
 
-    rm -f "$WAKEUP_FIFO" "$SLEEP_FIFO" "$LOCK_FILE"
+    # Lock file is preserved to prevent TOCTOU race transitions on quick restart
+    rm -f "$WAKEUP_FIFO" "$SLEEP_FIFO"
     rmdir "$STATE_DIR" 2>/dev/null || true
     
-    # Standardized FD closures: <&- for read, >&- for write/append
     exec 10<&- 2>/dev/null
     exec 9>&- 2>/dev/null
     exec 8<&- 2>/dev/null
@@ -146,7 +145,8 @@ declare -i UPTIME_REPLY=0
 [[ -f /proc/uptime ]] || { echo "Fatal: /proc/uptime required for accurate monotonic time." >&2; exit 1; }
 get_uptime() {
     local up _
-    read -t 1 -r up _ < /proc/uptime || return 1
+    # regular procfs files never block, native fast read is safe here
+    read -r up _ < /proc/uptime || return 1
     UPTIME_REPLY=$(( 10#${up%%.*} ))
 }
 
@@ -177,12 +177,11 @@ log_throttled() {
 }
 
 # ==============================================================================
-# HARDWARE DISCOVERY (FIXED: Topology updates never wipe runtime user-state)
+# HARDWARE DISCOVERY (Topology updates never wipe runtime user-state)
 # ==============================================================================
 scan_backlights() {
     local bl max_bright
     
-    # We clear and scan discovery arrays, but keep transient states (BL_DIMMED, BL_ORIG) intact
     BACKLIGHTS=()
     BL_MAX=()
     BL_MIN=()
@@ -231,8 +230,9 @@ scan_power_supplies() {
 # TELEMETRY & MATH
 # ==============================================================================
 update_telemetry() {
-    local i dev kind status online b_now b_full pct lowest=100
+    local i dev kind status online b_now b_full pct
     local has_battery=0 mains_online=0 any_discharging=0 any_charging=0
+    local total_pct=0 active_batteries=0
 
     BATTERY_PCT=100 SHOULD_DIM=0 POWER_INPUT=0
 
@@ -269,26 +269,29 @@ update_telemetry() {
 
         (( b_full <= 0 )) && continue
 
+        # Compute dynamic percentage per battery unit
         pct=$(( (b_now * 100) / b_full ))
-        
         (( pct > 100 )) && pct=100
-        (( pct < lowest )) && lowest=$pct
+
+        total_pct=$(( total_pct + pct ))
+        (( active_batteries++ ))
         has_battery=1
     done
 
     POWER_INPUT=$mains_online
     (( ! has_battery )) && { BATTERY_PCT=-1; return; }
 
-    BATTERY_PCT=$lowest
+    # Weighted Average prevents low-battery triggers on systems with empty secondary bays
+    BATTERY_PCT=$(( total_pct / active_batteries ))
     if (( mains_online || (any_charging && ! any_discharging) )); then
         SHOULD_DIM=0
     else
-        (( lowest <= THRESHOLD )) && SHOULD_DIM=1
+        (( BATTERY_PCT <= THRESHOLD )) && SHOULD_DIM=1
     fi
     
     if (( mains_online == 1 )); then
         CURRENT_POLL_INTERVAL=$(( BASE_POLL_INTERVAL * 5 ))
-    elif (( lowest > THRESHOLD + 15 )); then
+    elif (( BATTERY_PCT > THRESHOLD + 15 )); then
         CURRENT_POLL_INTERVAL=$BASE_POLL_INTERVAL
     else
         CURRENT_POLL_INTERVAL=$(( BASE_POLL_INTERVAL / 4 > 10 ? BASE_POLL_INTERVAL / 4 : 10 ))
@@ -308,23 +311,32 @@ smooth_dim() {
     steps=$(( diff / 15 ))
     (( steps < 5 ))  && steps=5
     (( steps > 15 )) && steps=15
+
+    local steps_sq=$(( steps * steps ))
+    local last_val=$start
     
     for (( step=1; step<steps; step++ )); do
-        # FIXED: Weber-Fechner Easing Curve.
-        # Dimming uses ease-out (fast start, slow finish) to keep details sharp at low levels.
-        # Restoring uses ease-in (slow start, fast finish) to prevent glaring visual pops.
+        # Weber-Fechner Ease curves using exact math calculations
         if (( target < start )); then
             inv_step=$(( steps - step ))
-            fraction=$(( 10000 - (inv_step * inv_step * 10000 / (steps * steps)) ))
+            fraction=$(( 10000 - (inv_step * inv_step * 10000 / steps_sq) ))
         else
-            fraction=$(( step * step * 10000 / (steps * steps) ))
+            fraction=$(( step * step * 10000 / steps_sq ))
         fi
         
         current_val=$(( start + (target - start) * fraction / 10000 ))
-        printf '%s\n' "$current_val" > "$bl/brightness" 2>/dev/null
-        zero_fork_sleep 0.02
+        
+        # CPU/Hardware Write Optimization: Only write intermediate transitions if values actually change
+        if (( current_val != last_val )); then
+            printf '%s\n' "$current_val" > "$bl/brightness" 2>/dev/null
+            last_val=$current_val
+            zero_fork_sleep 0.02
+        fi
     done
-    printf '%s\n' "$target" > "$bl/brightness" 2>/dev/null
+
+    if (( target != last_val )); then
+        printf '%s\n' "$target" > "$bl/brightness" 2>/dev/null
+    fi
     
     read -t 1 -r check_val < "$bl/brightness" 2>/dev/null || check_val=0
     if (( check_val != target && check_val != current_val )); then
@@ -335,11 +347,11 @@ smooth_dim() {
 }
 
 apply_dim() {
+    # Fix unbound variable and empty loop execution errors in Bash 4.2
     (( ${#BACKLIGHTS[@]} == 0 )) && return 0
-    # Hoisted 'expected' out of the loop to prevent redundant builtin executions
     local bl name current target reduction diff expected
 
-    for bl in ${BACKLIGHTS[@]+"${BACKLIGHTS[@]}"}; do
+    for bl in "${BACKLIGHTS[@]}"; do
         name="${bl##*/}"
         [[ ${BL_OVERRIDE["$name"]:-0} == 1 ]] && continue
 
@@ -380,10 +392,11 @@ apply_dim() {
 }
 
 apply_restore() {
+    # Fix unbound variable and empty loop execution errors in Bash 4.2
     (( ${#BACKLIGHTS[@]} == 0 )) && return 0
     local bl name current orig_saved
 
-    for bl in ${BACKLIGHTS[@]+"${BACKLIGHTS[@]}"}; do
+    for bl in "${BACKLIGHTS[@]}"; do
         name="${bl##*/}"
 
         if [[ "${BL_DIMMED["$bl"]:-0}" == "1" && -n "${BL_ORIG["$bl"]:-}" ]]; then
