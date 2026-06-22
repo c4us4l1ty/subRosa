@@ -67,22 +67,25 @@ EOF
     exit 0
 fi
 
-# TOCTOU-Safe State Directory Initialization
+# TOCTOU-Safe State Directory Initialization & Hardening
 mkdir -m 700 "$STATE_DIR" 2>/dev/null || true
 if [[ ! -d "$STATE_DIR" || ! -O "$STATE_DIR" ]]; then
     echo "Fatal: State dir compromised or unavailable." >&2; exit 1
 fi
+chmod 700 "$STATE_DIR" 2>/dev/null || true
 
-# TOCTOU-Safe FIFO Creation
+# TOCTOU-Safe FIFO Creation & Hardening
 mkfifo -m 600 "$WAKEUP_FIFO" 2>/dev/null || true
 if [[ ! -p "$WAKEUP_FIFO" || ! -O "$WAKEUP_FIFO" ]]; then
     echo "Fatal: Wakeup FIFO compromised or invalid." >&2; exit 1
 fi
+chmod 600 "$WAKEUP_FIFO" 2>/dev/null || true
 
 mkfifo -m 600 "$SLEEP_FIFO" 2>/dev/null || true
 if [[ ! -p "$SLEEP_FIFO" || ! -O "$SLEEP_FIFO" ]]; then
     echo "Fatal: Sleep FIFO compromised or invalid." >&2; exit 1
 fi
+chmod 600 "$SLEEP_FIFO" 2>/dev/null || true
 
 # Daemon Log Reopener
 reopen_logs() {
@@ -101,6 +104,8 @@ flock -n 9 || { echo "Fatal: Already running. Lock held by another instance." >&
 # Safe Array expansions; separated declaration and initialization for Bash < 4.4 compat
 declare -g -a BACKLIGHTS=() POWER_SUPPLIES=() PS_KIND=() PS_SCOPE=()
 declare -g -A BL_MAX BL_MIN BL_TOL BL_ORIG BL_TARGET BL_OVERRIDE BL_DIMMED LOG_LAST
+# System-call elimination lookup maps for optimized loops
+declare -g -A PS_PATH_VAL PS_PATH_LIMIT
 
 cleanup() {
     trap '' EXIT SIGINT SIGTERM SIGHUP SIGQUIT 
@@ -117,8 +122,8 @@ cleanup() {
         done
     fi
 
-    # Lock file is preserved to prevent TOCTOU race transitions on quick restart
-    rm -f "$WAKEUP_FIFO" "$SLEEP_FIFO"
+    # Lock file is cleanly removed now that execution is complete
+    rm -f "$LOCK_FILE" "$WAKEUP_FIFO" "$SLEEP_FIFO"
     rmdir "$STATE_DIR" 2>/dev/null || true
     
     exec 10<&- 2>/dev/null
@@ -205,6 +210,8 @@ scan_power_supplies() {
     POWER_SUPPLIES=()
     PS_KIND=()
     PS_SCOPE=()
+    PS_PATH_VAL=()
+    PS_PATH_LIMIT=()
 
     for dev in "$SYSFS_PS"/*; do
         [[ -f "$dev/type" ]] || continue
@@ -219,6 +226,23 @@ scan_power_supplies() {
 
         scope=""
         [[ -f "$dev/scope" ]] && read -t 1 -r scope < "$dev/scope" 2>/dev/null
+
+        # Cache the queryable telemetry file paths now to eliminate stat() syscalls in hot loop
+        if [[ "$kind" == "battery" ]]; then
+            if [[ -f "$dev/capacity" ]]; then
+                PS_PATH_VAL["$dev"]="$dev/capacity"
+                PS_PATH_LIMIT["$dev"]="direct"
+            elif [[ -f "$dev/energy_now" && -f "$dev/energy_full" ]]; then
+                PS_PATH_VAL["$dev"]="$dev/energy_now"
+                PS_PATH_LIMIT["$dev"]="$dev/energy_full"
+            elif [[ -f "$dev/charge_now" && -f "$dev/charge_full" ]]; then
+                PS_PATH_VAL["$dev"]="$dev/charge_now"
+                PS_PATH_LIMIT["$dev"]="$dev/charge_full"
+            else
+                # Battery exists but has no queryable nodes
+                continue
+            fi
+        fi
 
         POWER_SUPPLIES+=("$dev")
         PS_KIND+=("$kind")
@@ -255,18 +279,20 @@ update_telemetry() {
             charging|full|"not charging") any_charging=1 ;;
         esac
 
-        b_now=0; b_full=0
-        if [[ -f "$dev/capacity" ]]; then
-            read -t 1 -r b_now < "$dev/capacity" 2>/dev/null || b_now=0
+        b_now=""; b_full=""
+        local cached_now=${PS_PATH_VAL["$dev"]:-}
+        local cached_full=${PS_PATH_LIMIT["$dev"]:-}
+
+        if [[ "$cached_full" == "direct" ]]; then
+            read -t 1 -r b_now < "$cached_now" 2>/dev/null || b_now=""
             b_full=100
-        elif [[ -f "$dev/energy_now" && -f "$dev/energy_full" ]]; then
-            read -t 1 -r b_now < "$dev/energy_now" 2>/dev/null || b_now=0
-            read -t 1 -r b_full < "$dev/energy_full" 2>/dev/null || b_full=0
-        elif [[ -f "$dev/charge_now" && -f "$dev/charge_full" ]]; then
-            read -t 1 -r b_now < "$dev/charge_now" 2>/dev/null || b_now=0
-            read -t 1 -r b_full < "$dev/charge_full" 2>/dev/null || b_full=0
+        elif [[ -n "$cached_now" && -n "$cached_full" ]]; then
+            read -t 1 -r b_now < "$cached_now" 2>/dev/null || b_now=""
+            read -t 1 -r b_full < "$cached_full" 2>/dev/null || b_full=""
         fi
 
+        # Safeguard: Validate that sysfs values are integers to prevent Bash arithmetic syntax/parsing crashes
+        [[ "$b_now" =~ ^[0-9]+$ && "$b_full" =~ ^[0-9]+$ ]] || continue
         (( b_full <= 0 )) && continue
 
         # Compute dynamic percentage per battery unit
@@ -339,15 +365,18 @@ smooth_dim() {
     fi
     
     read -t 1 -r check_val < "$bl/brightness" 2>/dev/null || check_val=0
-    if (( check_val != target && check_val != current_val )); then
-        log_msg "Warning: Hardware rejected brightness on $name (requested $target, got $check_val)."
+    
+    # Hardware rounding safety check: many backlight drivers round requested values to discrete levels.
+    # We compare using the backlight tolerance limit instead of strict equality to prevent false-positive control releases.
+    local diff_check=$(( check_val > target ? check_val - target : target - check_val ))
+    if (( diff_check > ${BL_TOL["$bl"]:-2} )); then
+        log_msg "Warning: Hardware rejected brightness on $name (requested $target, got $check_val, diff $diff_check > tolerance)."
         return 1
     fi
     return 0
 }
 
 apply_dim() {
-    # Fix unbound variable and empty loop execution errors in Bash 4.2
     (( ${#BACKLIGHTS[@]} == 0 )) && return 0
     local bl name current target reduction diff expected
 
@@ -360,7 +389,7 @@ apply_dim() {
         if [[ "${BL_DIMMED["$bl"]:-0}" == "1" ]]; then
             expected=${BL_TARGET["$bl"]:-$current}
             diff=$(( current > expected ? current - expected : expected - current ))
-            if (( diff > ${BL_TOL["$bl"]} )); then
+            if (( diff > ${BL_TOL["$bl"]:-2} )); then
                 unset "BL_ORIG[$bl]"
                 unset "BL_TARGET[$bl]"
                 BL_DIMMED["$bl"]=0
@@ -372,7 +401,7 @@ apply_dim() {
             (( reduction < 1 )) && reduction=1
             target=$(( current - reduction ))
             
-            (( target < ${BL_MIN["$bl"]} )) && target=${BL_MIN["$bl"]}
+            (( target < ${BL_MIN["$bl"]:-1} )) && target=${BL_MIN["$bl"]:-1}
 
             if (( current > target )); then
                 if smooth_dim "$bl" "$current" "$target" "$name"; then
@@ -392,7 +421,6 @@ apply_dim() {
 }
 
 apply_restore() {
-    # Fix unbound variable and empty loop execution errors in Bash 4.2
     (( ${#BACKLIGHTS[@]} == 0 )) && return 0
     local bl name current orig_saved
 
