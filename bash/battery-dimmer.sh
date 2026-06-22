@@ -34,11 +34,12 @@ unset _var
 
 readonly THRESHOLD DIM_BY_PERCENT MIN_PERCENT BASE_POLL_INTERVAL SUSPEND_THRESHOLD LOG_THROTTLE RESCAN_EVERY UDEV_DEBOUNCE
 
-(( THRESHOLD >= 0 && THRESHOLD <= 100 ))          || exit 1
-(( DIM_BY_PERCENT > 0 && DIM_BY_PERCENT <= 100 )) || exit 1
-(( MIN_PERCENT >= 0 && MIN_PERCENT < 100 ))       || exit 1
-(( BASE_POLL_INTERVAL >= 10 ))                    || exit 1
-(( UDEV_DEBOUNCE >= 1 && UDEV_DEBOUNCE <= 60 ))   || exit 1
+# Added explicit error messages for out-of-bounds configurations
+(( THRESHOLD >= 0 && THRESHOLD <= 100 ))          || { echo "Fatal: THRESHOLD must be 0-100." >&2; exit 1; }
+(( DIM_BY_PERCENT > 0 && DIM_BY_PERCENT <= 100 )) || { echo "Fatal: DIM_BY_PERCENT must be 1-100." >&2; exit 1; }
+(( MIN_PERCENT >= 0 && MIN_PERCENT < 100 ))       || { echo "Fatal: MIN_PERCENT must be 0-99." >&2; exit 1; }
+(( BASE_POLL_INTERVAL >= 10 ))                    || { echo "Fatal: BASE_POLL_INTERVAL must be >= 10." >&2; exit 1; }
+(( UDEV_DEBOUNCE >= 1 && UDEV_DEBOUNCE <= 60 ))   || { echo "Fatal: UDEV_DEBOUNCE must be 1-60." >&2; exit 1; }
 
 # ==============================================================================
 # PATHS, TOCTOU-SAFE INITIALIZATION, & UDEV DEADLOCK PREVENTION
@@ -55,12 +56,11 @@ readonly UDEV_RULE="/etc/udev/rules.d/99-battery-dimmer.rules"
 export LC_ALL=C
 (( EUID == 0 )) || { echo "Fatal: Root required." >&2; exit 1; }
 
-# UDEV Deadlock-Immune Installation
+# UDEV Deadlock-Immune Installation (FIXED: Uses flock check to prevent zombie writers)
 if [[ "${1:-}" == "--install-udev" ]]; then
-    # Using 'dd' with nonblock ensures the udev worker thread never blocks if the daemon is dead.
     cat <<EOF > "$UDEV_RULE"
-# Wake up battery-dimmer. Non-blocking to prevent udev worker starvation/PID exhaustion.
-SUBSYSTEM=="power_supply", RUN+="/bin/sh -c 'echo 1 | dd of=${WAKEUP_FIFO} oflag=nonblock status=none 2>/dev/null || true'"
+# Wake up battery-dimmer. Non-blocking & immune to process starvation when daemon is stopped.
+SUBSYSTEM=="power_supply", RUN+="/bin/sh -c '! flock -n ${LOCK_FILE} -c true && echo 1 > ${WAKEUP_FIFO} &'"
 EOF
     udevadm control --reload-rules
     echo "Installed A++ udev rule. The daemon will wake instantly and safely on AC events."
@@ -73,14 +73,14 @@ if [[ ! -d "$STATE_DIR" || ! -O "$STATE_DIR" ]]; then
     echo "Fatal: State dir compromised or unavailable." >&2; exit 1
 fi
 
-# TOCTOU-Safe FIFO Creation (Atomic, validating ownership/type to prevent symlink attacks)
+# TOCTOU-Safe FIFO Creation
 mkfifo -m 600 "$WAKEUP_FIFO" 2>/dev/null || true
-if [[ ! -p "$WAKEUP_FIFO" || $(stat -c '%U' "$WAKEUP_FIFO") != "root" ]]; then
+if [[ ! -p "$WAKEUP_FIFO" || ! -O "$WAKEUP_FIFO" ]]; then
     echo "Fatal: Wakeup FIFO compromised or invalid." >&2; exit 1
 fi
 
 mkfifo -m 600 "$SLEEP_FIFO" 2>/dev/null || true
-if [[ ! -p "$SLEEP_FIFO" || $(stat -c '%U' "$SLEEP_FIFO") != "root" ]]; then
+if [[ ! -p "$SLEEP_FIFO" || ! -O "$SLEEP_FIFO" ]]; then
     echo "Fatal: Sleep FIFO compromised or invalid." >&2; exit 1
 fi
 
@@ -95,7 +95,12 @@ reopen_logs
 # DAEMON LOCKING & TRAPS (TOCTOU-IMMUNE FLOCK)
 # ==============================================================================
 exec 9> "$LOCK_FILE"
+# Secure the lock FIRST before setting traps, protecting against multi-instance collisions
 flock -n 9 || { echo "Fatal: Already running. Lock held by another instance." >&2; exit 1; }
+
+# Safe Array Expansion definitions for Bash < 4.4 compatibility under 'set -u'
+declare -g -a BACKLIGHTS=() POWER_SUPPLIES=() PS_KIND=() PS_SCOPE=()
+declare -g -A BL_MAX=() BL_MIN=() BL_TOL=() BL_ORIG=() BL_TARGET=() BL_OVERRIDE=() BL_DIMMED=() LOG_LAST=()
 
 cleanup() {
     trap '' EXIT SIGINT SIGTERM SIGHUP SIGQUIT 
@@ -105,7 +110,8 @@ cleanup() {
     log_msg "Stopping daemon. Restoring backlight states..."
     
     if (( ${#BACKLIGHTS[@]} > 0 )); then
-        for bl in "${BACKLIGHTS[@]}"; do
+        # FIXED: Safe array expansions to prevent crashes on older Bash versions
+        for bl in ${BACKLIGHTS[@]+"${BACKLIGHTS[@]}"}; do
             if [[ "${BL_DIMMED["$bl"]:-0}" == "1" && -n "${BL_ORIG["$bl"]:-}" ]]; then
                 printf '%s\n' "${BL_ORIG["$bl"]}" > "$bl/brightness" 2>/dev/null
             fi
@@ -115,13 +121,15 @@ cleanup() {
     rm -f "$WAKEUP_FIFO" "$SLEEP_FIFO" "$LOCK_FILE"
     rmdir "$STATE_DIR" 2>/dev/null || true
     
+    # Standardized FD closures: <&- for read, >&- for write/append
     exec 10<&- 2>/dev/null
-    exec 9<&- 2>/dev/null
+    exec 9>&- 2>/dev/null
     exec 8<&- 2>/dev/null
     exec 7>&- 2>/dev/null
     exit 0
 }
 
+# Arm traps only after successfully acquiring lock
 trap cleanup EXIT SIGINT SIGTERM SIGQUIT
 trap reopen_logs SIGHUP
 
@@ -129,11 +137,8 @@ exec 8<> "$WAKEUP_FIFO"
 exec 10<> "$SLEEP_FIFO" # Dedicated internal zero-fork sleep FD
 
 # ==============================================================================
-# GLOBALS & MONOTONIC TIME TRACKING (Zero-Fork)
+# MONOTONIC TIME TRACKING & NATIVE SLEEP (Zero-Fork)
 # ==============================================================================
-declare -a BACKLIGHTS=() POWER_SUPPLIES=() PS_KIND=() PS_SCOPE=()
-declare -A BL_MAX=() BL_MIN=() BL_TOL=() BL_ORIG=() BL_OVERRIDE=() BL_DIMMED=() LOG_LAST=()
-
 declare -i BATTERY_PCT=100 SHOULD_DIM=0 POWER_INPUT=0
 declare -i CLEANING_UP=0 WAKEUP_COUNT=0 CURRENT_POLL_INTERVAL=$BASE_POLL_INTERVAL
 
@@ -142,7 +147,7 @@ declare -i UPTIME_REPLY=0
 get_uptime() {
     local up _
     read -t 1 -r up _ < /proc/uptime || return 1
-    UPTIME_REPLY=${up%%.*}
+    UPTIME_REPLY=$(( 10#${up%%.*} ))
 }
 
 get_uptime
@@ -172,17 +177,19 @@ log_throttled() {
 }
 
 # ==============================================================================
-# HARDWARE DISCOVERY
+# HARDWARE DISCOVERY (FIXED: Topology updates never wipe runtime user-state)
 # ==============================================================================
 scan_backlights() {
     local bl max_bright
-    unset -v BACKLIGHTS BL_MAX BL_MIN BL_TOL BL_ORIG BL_OVERRIDE BL_DIMMED
-    declare -g -a BACKLIGHTS=()
-    declare -g -A BL_MAX=() BL_MIN=() BL_TOL=() BL_ORIG=() BL_OVERRIDE=() BL_DIMMED=()
+    
+    # We clear and scan discovery arrays, but keep transient states (BL_DIMMED, BL_ORIG) intact
+    BACKLIGHTS=()
+    BL_MAX=()
+    BL_MIN=()
+    BL_TOL=()
 
     for bl in "$SYSFS_BL"/*; do
         [[ -f "$bl/brightness" && -f "$bl/max_brightness" ]] || continue
-        # Timeouts applied to ALL sysfs reads to prevent kernel driver hangs
         read -t 1 -r max_bright < "$bl/max_brightness" 2>/dev/null || continue
         [[ "$max_bright" =~ ^[0-9]+$ ]] || continue
         (( max_bright <= 0 )) && continue
@@ -196,8 +203,9 @@ scan_backlights() {
 
 scan_power_supplies() {
     local dev type kind scope
-    unset -v POWER_SUPPLIES PS_KIND PS_SCOPE
-    declare -g -a POWER_SUPPLIES=() PS_KIND=() PS_SCOPE=()
+    POWER_SUPPLIES=()
+    PS_KIND=()
+    PS_SCOPE=()
 
     for dev in "$SYSFS_PS"/*; do
         [[ -f "$dev/type" ]] || continue
@@ -261,7 +269,6 @@ update_telemetry() {
 
         (( b_full <= 0 )) && continue
 
-        # Multiplication precedes division to prevent bash float truncation
         pct=$(( (b_now * 100) / b_full ))
         
         (( pct > 100 )) && pct=100
@@ -293,22 +300,28 @@ update_telemetry() {
 # ==============================================================================
 smooth_dim() {
     local bl=$1 start=$2 target=$3 name=$4
-    local diff check_val current_val step steps=15 fraction
+    local diff check_val current_val step steps fraction inv_step
     
     diff=$(( target > start ? target - start : start - target ))
     (( diff == 0 )) && return 0
-    (( diff < steps )) && steps=$diff
-    (( steps > 30 )) && steps=30 # Hard cap iteration max
+
+    steps=$(( diff / 15 ))
+    (( steps < 5 ))  && steps=5
+    (( steps > 15 )) && steps=15
     
     for (( step=1; step<steps; step++ )); do
-        # Logarithmic/Geometric Perceptual Interpolation using quadratic easing
-        # Simulates the Weber-Fechner perceptual curve within Bash Integer math constraints
-        fraction=$(( step * step * 10000 / (steps * steps) ))
+        # FIXED: Weber-Fechner Easing Curve.
+        # Dimming uses ease-out (fast start, slow finish) to keep details sharp at low levels.
+        # Restoring uses ease-in (slow start, fast finish) to prevent glaring visual pops.
+        if (( target < start )); then
+            inv_step=$(( steps - step ))
+            fraction=$(( 10000 - (inv_step * inv_step * 10000 / (steps * steps)) ))
+        else
+            fraction=$(( step * step * 10000 / (steps * steps) ))
+        fi
+        
         current_val=$(( start + (target - start) * fraction / 10000 ))
-        
         printf '%s\n' "$current_val" > "$bl/brightness" 2>/dev/null
-        
-        # Truly zero-fork delay
         zero_fork_sleep 0.02
     done
     printf '%s\n' "$target" > "$bl/brightness" 2>/dev/null
@@ -323,36 +336,44 @@ smooth_dim() {
 
 apply_dim() {
     (( ${#BACKLIGHTS[@]} == 0 )) && return 0
-    local bl name current target reduction diff
+    # Hoisted 'expected' out of the loop to prevent redundant builtin executions
+    local bl name current target reduction diff expected
 
-    for bl in "${BACKLIGHTS[@]}"; do
+    for bl in ${BACKLIGHTS[@]+"${BACKLIGHTS[@]}"}; do
         name="${bl##*/}"
         [[ ${BL_OVERRIDE["$name"]:-0} == 1 ]] && continue
 
         read -t 1 -r current < "$bl/brightness" 2>/dev/null || current=0
-        reduction=$(( (current * DIM_BY_PERCENT + 99) / 100 ))
-        (( reduction < 1 )) && reduction=1
-        target=$(( current - reduction ))
-        
-        (( target < ${BL_MIN["$bl"]} )) && target=${BL_MIN["$bl"]}
 
         if [[ "${BL_DIMMED["$bl"]:-0}" == "1" ]]; then
-            diff=$(( current > target ? current - target : target - current ))
+            expected=${BL_TARGET["$bl"]:-$current}
+            diff=$(( current > expected ? current - expected : expected - current ))
             if (( diff > ${BL_TOL["$bl"]} )); then
                 unset "BL_ORIG[$bl]"
+                unset "BL_TARGET[$bl]"
                 BL_DIMMED["$bl"]=0
                 BL_OVERRIDE["$name"]=1
                 log_throttled "$name" "Hardware override detected on $name. Released control."
             fi
-        elif (( current > target )); then
-            if smooth_dim "$bl" "$current" "$target" "$name"; then
-                BL_ORIG["$bl"]=$current
-                BL_DIMMED["$bl"]=1
-                log_msg "Dimmed $name smoothly (${current}->${target}, bat=${BATTERY_PCT}%)"
-            else
-                unset "BL_ORIG[$bl]"
-                BL_DIMMED["$bl"]=0
-                BL_OVERRIDE["$name"]=1
+        else
+            reduction=$(( (current * DIM_BY_PERCENT + 99) / 100 ))
+            (( reduction < 1 )) && reduction=1
+            target=$(( current - reduction ))
+            
+            (( target < ${BL_MIN["$bl"]} )) && target=${BL_MIN["$bl"]}
+
+            if (( current > target )); then
+                if smooth_dim "$bl" "$current" "$target" "$name"; then
+                    BL_ORIG["$bl"]=$current
+                    BL_TARGET["$bl"]=$target
+                    BL_DIMMED["$bl"]=1
+                    log_msg "Dimmed $name smoothly (${current}->${target}, bat=${BATTERY_PCT}%)"
+                else
+                    unset "BL_ORIG[$bl]"
+                    unset "BL_TARGET[$bl]"
+                    BL_DIMMED["$bl"]=0
+                    BL_OVERRIDE["$name"]=1
+                fi
             fi
         fi
     done
@@ -362,7 +383,7 @@ apply_restore() {
     (( ${#BACKLIGHTS[@]} == 0 )) && return 0
     local bl name current orig_saved
 
-    for bl in "${BACKLIGHTS[@]}"; do
+    for bl in ${BACKLIGHTS[@]+"${BACKLIGHTS[@]}"}; do
         name="${bl##*/}"
 
         if [[ "${BL_DIMMED["$bl"]:-0}" == "1" && -n "${BL_ORIG["$bl"]:-}" ]]; then
@@ -373,6 +394,7 @@ apply_restore() {
                 log_msg "Restored $name to original ($orig_saved)."
             
             unset "BL_ORIG[$bl]"
+            unset "BL_TARGET[$bl]"
             BL_DIMMED["$bl"]=0
         fi
 
@@ -381,7 +403,7 @@ apply_restore() {
 }
 
 # ==============================================================================
-# MAIN LOOP
+# MAIN EVENT LOOP
 # ==============================================================================
 scan_backlights
 scan_power_supplies
@@ -391,16 +413,9 @@ log_msg "Started. Threshold=${THRESHOLD}%, Dim=${DIM_BY_PERCENT}%, Max Polling=$
 while read -t 0 -u 8; do read -r -t 0.05 -u 8 _ || break; done
 
 while true; do
-    # Sleep until timeout or instant interrupt from Udev pipe.
-    # 'read' returns 0 if it successfully read data (udev event).
-    # It returns >0 if it timed out.
+    # Sleep until timeout or instant interrupt from Udev pipe
     if read -t "$CURRENT_POLL_INTERVAL" -r -u 8 _; then
-        # UDEV EVENT DETECTED
-        # Debounce: Sleep to allow flapping hardware (e.g., loose charging cables) 
-        # to settle. The kernel will buffer rapid-fire events in the FIFO during this time.
         zero_fork_sleep "$UDEV_DEBOUNCE"
-        
-        # Drain the accumulated flapping signals cleanly without blocking
         while read -t 0 -u 8; do 
             read -r -t 0.05 -u 8 _ || break
         done
