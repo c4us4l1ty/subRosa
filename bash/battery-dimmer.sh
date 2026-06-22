@@ -327,43 +327,14 @@ update_telemetry() {
 # ==============================================================================
 # ACTIONS & HARDWARE CONFIRMATION
 # ==============================================================================
-smooth_dim() {
+instant_dim() {
     local bl=$1 start=$2 target=$3 name=$4
-    local diff check_val current_val step steps fraction inv_step
+    local check_val
     
-    diff=$(( target > start ? target - start : start - target ))
-    (( diff == 0 )) && return 0
-
-    steps=$(( diff / 15 ))
-    (( steps < 5 ))  && steps=5
-    (( steps > 15 )) && steps=15
-
-    local steps_sq=$(( steps * steps ))
-    local last_val=$start
+    # Write the target level directly to the sysfs brightness control immediately
+    printf '%s\n' "$target" > "$bl/brightness" 2>/dev/null
     
-    for (( step=1; step<steps; step++ )); do
-        # Weber-Fechner Ease curves using exact math calculations
-        if (( target < start )); then
-            inv_step=$(( steps - step ))
-            fraction=$(( 10000 - (inv_step * inv_step * 10000 / steps_sq) ))
-        else
-            fraction=$(( step * step * 10000 / steps_sq ))
-        fi
-        
-        current_val=$(( start + (target - start) * fraction / 10000 ))
-        
-        # CPU/Hardware Write Optimization: Only write intermediate transitions if values actually change
-        if (( current_val != last_val )); then
-            printf '%s\n' "$current_val" > "$bl/brightness" 2>/dev/null
-            last_val=$current_val
-            zero_fork_sleep 0.02
-        fi
-    done
-
-    if (( target != last_val )); then
-        printf '%s\n' "$target" > "$bl/brightness" 2>/dev/null
-    fi
-    
+    # Read back current level to confirm driver registration
     read -t 1 -r check_val < "$bl/brightness" 2>/dev/null || check_val=0
     
     # Hardware rounding safety check: many backlight drivers round requested values to discrete levels.
@@ -404,11 +375,11 @@ apply_dim() {
             (( target < ${BL_MIN["$bl"]:-1} )) && target=${BL_MIN["$bl"]:-1}
 
             if (( current > target )); then
-                if smooth_dim "$bl" "$current" "$target" "$name"; then
+                if instant_dim "$bl" "$current" "$target" "$name"; then
                     BL_ORIG["$bl"]=$current
                     BL_TARGET["$bl"]=$target
                     BL_DIMMED["$bl"]=1
-                    log_msg "Dimmed $name smoothly (${current}->${target}, bat=${BATTERY_PCT}%)"
+                    log_msg "Dimmed $name instantly (${current}->${target}, bat=${BATTERY_PCT}%)"
                 else
                     unset "BL_ORIG[$bl]"
                     unset "BL_TARGET[$bl]"
@@ -431,8 +402,8 @@ apply_restore() {
             orig_saved=${BL_ORIG["$bl"]}
             read -t 1 -r current < "$bl/brightness" 2>/dev/null || current=0
             
-            smooth_dim "$bl" "$current" "$orig_saved" "$name" && \
-                log_msg "Restored $name to original ($orig_saved)."
+            instant_dim "$bl" "$current" "$orig_saved" "$name" && \
+                log_msg "Restored $name to original ($orig_saved) instantly."
             
             unset "BL_ORIG[$bl]"
             unset "BL_TARGET[$bl]"
