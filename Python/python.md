@@ -1,18 +1,201 @@
 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
 
-# 2. Operators
+1. Advanced File Handling (Text & CSV)
+Text Files
+Python
 
-### Arithmetic
+# Writing (overwrites file)
+file = open("data.txt", "w")
+file.write("Line 1\n")
+file.writelines(["Line 2\n", "Line 3\n"])
+file.close()
 
-```python
-+
--
-*
-/
-%
-**
-//
+# Appending
+file = open("data.txt", "a")
+file.write("New data\n")
+file.close()
+
+# Reading safely (Context Manager - Recommended)
+with open("data.txt", "r") as file:
+    content = file.read()       # Entire file as a single string
+    # lines = file.readlines()  # List of strings (with \n)
+    # line = file.readline()    # Single line
+
+CSV Handling via String Manipulation
+Python
+
+with open("records.csv", "r") as file:
+    for line in file:
+        fields = line.strip().split(",")
+        print(f"ID: {fields[0]}, Name: {fields[1]}")
+
+2. Object-Oriented Programming (OOP)
+Python
+
+class Person:
+    # Constructor
+    def __init__(self, name, age):
+        self.__name = name      # Private attribute (encapsulation)
+        self.__age = age
+
+    # Getter methods
+    def get_name(self):
+        return self.__name
+
+    def get_age(self):
+        return self.__age
+
+    # Setter methods
+    def set_age(self, age):
+        self.__age = age
+
+    def display(self):
+        print(f"Name: {self.__name}, Age: {self.__age}")
+
+
+# Inheritance
+class Student(Person):
+    def __init__(self, name, age, student_id):
+        super().__init__(name, age)  # Call parent constructor
+        self.__student_id = student_id
+
+    # Polymorphism / Method Overriding
+    def display(self):
+        super().display()
+        print(f"Student ID: {self.__student_id}")
+
+# Object Instantiation
+s1 = Student("Alice", 20, "S1092")
+s1.display()
+
+3. Sorting & Searching Algorithms
+Binary Search (Requires Sorted Array)
+Python
+
+def binary_search(arr, target):
+    low = 0
+    high = len(arr) - 1
+    
+    while low <= high:
+        mid = (low + high) // 2
+        if arr[mid] == target:
+            return mid          # Found index
+        elif target < arr[mid]:
+            high = mid - 1      # Search left half
+        else:
+            low = mid + 1       # Search right half
+    return -1                   # Not found
+
+Bubble Sort
+Python
+
+def bubble_sort(arr):
+    n = len(arr)
+    for i in range(n):
+        swapped = False
+        for j in range(0, n - i - 1):
+            if arr[j] > arr[j + 1]:
+                arr[j], arr[j + 1] = arr[j + 1], arr[j]  # Swap
+                swapped = True
+        if not swapped:  # Optimization: break if already sorted
+            break
+    return arr
+
+Insertion Sort
+Python
+
+def insertion_sort(arr):
+    for i in range(1, len(arr)):
+        key = arr[i]
+        j = i - 1
+        while j >= 0 and arr[j] > key:
+            arr[j + 1] = arr[j]
+            j -= 1
+        arr[j + 1] = key
+    return arr
+
+4. Abstract Data Types (ADTs)
+Stack (LIFO - Last In, First Out)
+
+Implemented using a standard Python list.
+Python
+
+stack = []
+
+# Push
+stack.append("A")
+
+# Pop
+if len(stack) > 0:
+    item = stack.pop()
+
+# Peek
+if len(stack) > 0:
+    top_item = stack[-1]
+
+Queue (FIFO - First In, First Out)
+Python
+
+queue = []
+
+# Enqueue
+queue.append("A")
+
+# Dequeue
+if len(queue) > 0:
+    item = queue.pop(0)
+
+# Front peek
+if len(queue) > 0:
+    front_item = queue[0]
+
+Linked Nodes (Paper 4 Pointer-based structures)
+Python
+
+class Node:
+    def __init__(self, data, next_pointer):
+        self.data = data
+        self.next_pointer = next_pointer
+
+# Creating a static array of nodes simulating pointers
+nodes = [Node("Apple", 1), Node("Banana", 2), Node("Cherry", -1)]
+head_pointer = 0
+
+current = head_pointer
+while current != -1:
+    print(nodes[current].data)
+    current = nodes[current].next_pointer
+
+5. Recursion (Advanced Patterns)
+Recursive Factorial
+Python
+
+def factorial(n):
+    if n == 0 or n == 1:  # Base Case
+        return 1
+    return n * factorial(n - 1)  # Recursive Step
+
+Recursive Binary Search
+Python
+
+def recursive_binary_search(arr, low, high, target):
+    if low > high:
+        return -1
+    
+    mid = (low + high) // 2
+    if arr[mid] == target:
+        return mid
+    elif target < arr[mid]:
+        return recursive_binary_search(arr, low, mid - 1, target)
+    else:
+        return recursive_binary_search(arr, mid + 1, high, target)
+
+pass
+
+global
 ```
+---
+
 
 Example
 
@@ -767,198 +950,3 @@ write()
 
 close()
 
-1. Advanced File Handling (Text & CSV)
-Text Files
-Python
-
-# Writing (overwrites file)
-file = open("data.txt", "w")
-file.write("Line 1\n")
-file.writelines(["Line 2\n", "Line 3\n"])
-file.close()
-
-# Appending
-file = open("data.txt", "a")
-file.write("New data\n")
-file.close()
-
-# Reading safely (Context Manager - Recommended)
-with open("data.txt", "r") as file:
-    content = file.read()       # Entire file as a single string
-    # lines = file.readlines()  # List of strings (with \n)
-    # line = file.readline()    # Single line
-
-CSV Handling via String Manipulation
-Python
-
-with open("records.csv", "r") as file:
-    for line in file:
-        fields = line.strip().split(",")
-        print(f"ID: {fields[0]}, Name: {fields[1]}")
-
-2. Object-Oriented Programming (OOP)
-Python
-
-class Person:
-    # Constructor
-    def __init__(self, name, age):
-        self.__name = name      # Private attribute (encapsulation)
-        self.__age = age
-
-    # Getter methods
-    def get_name(self):
-        return self.__name
-
-    def get_age(self):
-        return self.__age
-
-    # Setter methods
-    def set_age(self, age):
-        self.__age = age
-
-    def display(self):
-        print(f"Name: {self.__name}, Age: {self.__age}")
-
-
-# Inheritance
-class Student(Person):
-    def __init__(self, name, age, student_id):
-        super().__init__(name, age)  # Call parent constructor
-        self.__student_id = student_id
-
-    # Polymorphism / Method Overriding
-    def display(self):
-        super().display()
-        print(f"Student ID: {self.__student_id}")
-
-# Object Instantiation
-s1 = Student("Alice", 20, "S1092")
-s1.display()
-
-3. Sorting & Searching Algorithms
-Binary Search (Requires Sorted Array)
-Python
-
-def binary_search(arr, target):
-    low = 0
-    high = len(arr) - 1
-    
-    while low <= high:
-        mid = (low + high) // 2
-        if arr[mid] == target:
-            return mid          # Found index
-        elif target < arr[mid]:
-            high = mid - 1      # Search left half
-        else:
-            low = mid + 1       # Search right half
-    return -1                   # Not found
-
-Bubble Sort
-Python
-
-def bubble_sort(arr):
-    n = len(arr)
-    for i in range(n):
-        swapped = False
-        for j in range(0, n - i - 1):
-            if arr[j] > arr[j + 1]:
-                arr[j], arr[j + 1] = arr[j + 1], arr[j]  # Swap
-                swapped = True
-        if not swapped:  # Optimization: break if already sorted
-            break
-    return arr
-
-Insertion Sort
-Python
-
-def insertion_sort(arr):
-    for i in range(1, len(arr)):
-        key = arr[i]
-        j = i - 1
-        while j >= 0 and arr[j] > key:
-            arr[j + 1] = arr[j]
-            j -= 1
-        arr[j + 1] = key
-    return arr
-
-4. Abstract Data Types (ADTs)
-Stack (LIFO - Last In, First Out)
-
-Implemented using a standard Python list.
-Python
-
-stack = []
-
-# Push
-stack.append("A")
-
-# Pop
-if len(stack) > 0:
-    item = stack.pop()
-
-# Peek
-if len(stack) > 0:
-    top_item = stack[-1]
-
-Queue (FIFO - First In, First Out)
-Python
-
-queue = []
-
-# Enqueue
-queue.append("A")
-
-# Dequeue
-if len(queue) > 0:
-    item = queue.pop(0)
-
-# Front peek
-if len(queue) > 0:
-    front_item = queue[0]
-
-Linked Nodes (Paper 4 Pointer-based structures)
-Python
-
-class Node:
-    def __init__(self, data, next_pointer):
-        self.data = data
-        self.next_pointer = next_pointer
-
-# Creating a static array of nodes simulating pointers
-nodes = [Node("Apple", 1), Node("Banana", 2), Node("Cherry", -1)]
-head_pointer = 0
-
-current = head_pointer
-while current != -1:
-    print(nodes[current].data)
-    current = nodes[current].next_pointer
-
-5. Recursion (Advanced Patterns)
-Recursive Factorial
-Python
-
-def factorial(n):
-    if n == 0 or n == 1:  # Base Case
-        return 1
-    return n * factorial(n - 1)  # Recursive Step
-
-Recursive Binary Search
-Python
-
-def recursive_binary_search(arr, low, high, target):
-    if low > high:
-        return -1
-    
-    mid = (low + high) // 2
-    if arr[mid] == target:
-        return mid
-    elif target < arr[mid]:
-        return recursive_binary_search(arr, low, mid - 1, target)
-    else:
-        return recursive_binary_search(arr, mid + 1, high, target)
-
-pass
-
-global
-```
----
