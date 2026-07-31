@@ -1,33 +1,5 @@
 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
 
-# 1. Variables
-
-```python
-age = 18
-pi = 3.14
-name = "John"
-isPassed = True
-```
-
-### Input
-
-```python
-name = input("Name: ")
-age = int(input("Age: "))
-height = float(input("Height: "))
-```
-
-### Output
-
-```python
-print(name)
-print(age, height)
-print("Age =", age)
-print(f"Hello {name}")
-```
-
----
-
 # 2. Operators
 
 ### Arithmetic
