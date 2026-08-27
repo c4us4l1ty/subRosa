@@ -18,3 +18,15 @@ Type=Application
 Categories=Development;IDE;
 StartupWMClass=Godot
 MimeType=application/x-godot-project;
+
+
+  "policies": {
+    "BlockAboutProfiles": true,
+    "DisablePrivateBrowsing": true,
+    "WebsiteFilter": {
+      "Block": [
+        "*://*.proxyium.com/*"
+      ]
+    }
+  }
+}
