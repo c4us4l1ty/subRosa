@@ -1,11 +1,11 @@
 [Desktop Entry]
-Name=Antigravity IDE
-Exec=/home/von/Applications/Antigravity-IDE/antigravity-ide
-Icon=/home/von/Applications/Antigravity-IDE/resources/app/out/media/code-icon.svg
 Type=Application
+Name=Antigravity IDE
+Comment=Antigravity IDE Application
+Exec=/home/von/Applications/AntigravityIDE/antigravity-ide
+Icon=/home/von/Applications/AntigravityIDE/resources/app/out/media/code-icon.svg
 Terminal=false
 Categories=Development;IDE;
-StartupWMClass=antigravity-ide
 
 
 [Desktop Entry]
@@ -19,14 +19,18 @@ Categories=Development;IDE;
 StartupWMClass=Godot
 MimeType=application/x-godot-project;
 
-
+                                                                                     
+{
   "policies": {
-    "BlockAboutProfiles": true,
     "DisablePrivateBrowsing": true,
     "WebsiteFilter": {
       "Block": [
-        "*://*.proxyium.com/*"
+        "https://proxyium.com/*",
+        "http://proxyium.com/*",
+        "https://*.proxyium.com/*",
+        "http://*.proxyium.com/*"
       ]
     }
   }
 }
+
