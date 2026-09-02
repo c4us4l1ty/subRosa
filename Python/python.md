@@ -1,4 +1,33 @@
-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
+// Procedure to sort a 1D array of integers in ascending order
+PROCEDURE BubbleSort(BYREF List : ARRAY, DECLARE Length : INTEGER)
+    DECLARE Pass : INTEGER
+    DECLARE Index : INTEGER
+    DECLARE Temp : INTEGER
+    DECLARE Swapped : BOOLEAN
+    
+    DECLARE UpperBound : INTEGER
+    UpperBound ← Length - 1
+    
+    REPEAT
+        Swapped ← FALSE
+        
+        FOR Index ← 1 TO UpperBound
+            IF List[Index] > List[Index + 1] THEN
+                // Swap adjacent elements
+                Temp ← List[Index]
+                List[Index] ← List[Index + 1]
+                List[Index + 1] ← Temp
+                
+                Swapped ← TRUE
+            ENDIF
+        NEXT Index
+        
+        // Optimization: Reduce upper bound after each pass 
+        // as the largest element reaches its final position
+        UpperBound ← UpperBound - 1
+        
+    UNTIL Swapped = FALSE OR UpperBound = 0
+ENDPROCEDURE
 
 1. Advanced File Handling (Text & CSV)
 Text Files
