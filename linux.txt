@@ -4,6 +4,7 @@ Name=Antigravity IDE
 Comment=Antigravity IDE Application
 Exec=/home/von/Applications/AntigravityIDE/antigravity-ide
 Icon=/home/von/Applications/AntigravityIDE/resources/app/out/media/code-icon.svg
+StartupWMClass=antigravity-ide
 Terminal=false
 Categories=Development;IDE;
 
