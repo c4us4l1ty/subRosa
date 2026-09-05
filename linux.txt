@@ -1,25 +1,3 @@
-[Desktop Entry]
-Type=Application
-Name=Antigravity IDE
-Comment=Antigravity IDE Application
-Exec=/home/von/Applications/AntigravityIDE/antigravity-ide
-Icon=/home/von/Applications/AntigravityIDE/resources/app/out/media/code-icon.svg
-StartupWMClass=antigravity-ide
-Terminal=false
-Categories=Development;IDE;
-
-
-[Desktop Entry]
-Name=Godot Engine
-Comment=Godot Engine 4.6.3
-Exec=/home/von/Applications/Godot_v4.6.3-stable_linux.x86_64 %f
-Icon=/home/von/.local/share/icons/godot.png
-Terminal=false
-Type=Application
-Categories=Development;IDE;
-StartupWMClass=Godot
-MimeType=application/x-godot-project;
-
                                                                                      
 {
   "policies": {
