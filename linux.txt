@@ -13,3 +13,60 @@
   }
 }
 
+
+
+
+KDE Plasma stores all desktop edits, layout configs, keyboard shortcuts, and themes in standard hidden files inside your home folder. You can back these up manually using native terminal commands (`tar` or `rsync`) with no 3rd-party tools required.
+
+---
+
+### Step 1: On your CURRENT system
+
+Open a terminal and run this single command to compress all core KDE configuration files into one `.tar.gz` archive:
+
+```bash
+tar -czvf ~/kde-settings-backup.tar.gz \
+  ~/.config/plasma* \
+  ~/.config/kdeglobals \
+  ~/.config/kglobalshortcutsrc \
+  ~/.config/kwinrc \
+  ~/.config/kscreenlockerrc \
+  ~/.config/latte* \
+  ~/.local/share/plasma \
+  ~/.local/share/kwin
+
+```
+
+* **What this grabs:** Panel/widget layouts, color schemes, keybindings, window rules, lock screen settings, and custom plasma desktop extensions.
+* **Next action:** Upload the generated `kde-settings-backup.tar.gz` file (found in your Home folder) directly to your cloud storage.
+
+*(Optional)* If you installed custom icon packs or cursor themes manually into your home directory, add `~/.local/share/icons` and `~/.local/share/themes` to the command above.
+
+---
+
+### Step 2: On your NEW system
+
+1. Download `kde-settings-backup.tar.gz` from your cloud to your new system's Home folder.
+2. Close any open settings windows.
+3. Open a terminal and extract the files directly into your new home directory:
+
+```bash
+tar -xzvf ~/kde-settings-backup.tar.gz -C ~
+
+```
+
+4. **Apply the changes:** Either restart the Plasma shell immediately or log out and back in:
+
+```bash
+kpackagetool5 --type Plasma/Layoutjs /dev/null 2>/dev/null; kquitapp5 plasmashell && kstart5 plasmashell &
+
+```
+
+*(On KDE Plasma 6 systems, simply run `systemctl --user restart plasma-plasmashell` or log out and log back in).*
+
+---
+
+### Key Notes for Native Backup
+
+* **Version Compatibility:** If your old OS used KDE Plasma 5 and your new OS uses KDE Plasma 6, core settings (colors, shortcuts, keybindings) transfer smoothly, but custom applets/widgets designed strictly for Plasma 5 might need to be re-downloaded from System Settings.
+* **App Settings:** If you also want settings for native KDE apps (like Konsole, Dolphin, or Kate), append `~/.config/kate*`, `~/.config/konsolerc`, and `~/.config/dolphinrc` to the `tar` command in Step 1.
