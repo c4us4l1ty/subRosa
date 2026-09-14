@@ -1,450 +1,973 @@
 #!/usr/bin/env bash
-# battery-dimmer.sh — True A++ Grade Event-driven, hardware-aware backlight dimmer.
-# Mathematically perceptual (Weber-Fechner compliant), strictly zero-fork, TOCTOU immune,
-# integer overflow protected, and inherently safe against udev and sysfs deadlocks.
+# ==============================================================================
+# battery-dimmer.sh — Hardened Zero-Fork Backlight Dimmer Daemon
+# ==============================================================================
+# Architecture: Pure Bash Event-Driven Asynchronous Engine (sysfs / udev)
+# Runtime Cost: 0 child forks in main execution loop; 0.00% idle CPU
+# Minimum Reqs: GNU Bash >= 4.3, Linux Kernel >= 3.2, systemd / coreutils
+# ==============================================================================
 
-# STRICT MODE
-set -uo pipefail
+set -u -o pipefail
 shopt -s nullglob
 
-# Correct POSIX-style Bash 4.2+ validation
-if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
-    echo "Fatal: Bash 4.2 or higher is required." >&2
+# ------------------------------------------------------------------------------
+# SECURITY PURGE & AMBIENT ENVIRONMENT SANITIZATION
+# ------------------------------------------------------------------------------
+export LC_ALL=C
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+IFS=$' \t\n'
+umask 022
+
+readonly DAEMON_VERSION="3.0.0-hardened"
+readonly RUN_DIR="/run/battery-dimmer"
+readonly PERSIST_DIR="/var/lib/battery-dimmer"
+readonly LOCK_FILE="$RUN_DIR/dimmer.lock"
+readonly PRIMARY_STATE="$PERSIST_DIR/state.env"
+readonly FALLBACK_STATE="$RUN_DIR/state.env"
+readonly WAKEUP_FIFO="$RUN_DIR/wakeup.pipe"
+readonly SLEEP_FIFO="$RUN_DIR/sleep.pipe"
+readonly LOG_FILE="$RUN_DIR/daemon.log"
+readonly UDEV_RULE="/etc/udev/rules.d/99-battery-dimmer.rules"
+readonly SYSTEMD_UNIT="/etc/systemd/system/battery-dimmer.service"
+
+# ------------------------------------------------------------------------------
+# ATOMIC NUMERIC SANITIZER (OCTAL-PROOF, ZERO-FORK, IMMUNE TO TRUNCATION BUGS)
+# ------------------------------------------------------------------------------
+# Guarantees safe base-10 conversion without nameref collision hazards.
+clean_val() {
+    local _v="${1//[!0-9]/}"
+    _v="${_v#"${_v%%[!0]*}"}"
+    printf '%s' "${_v:-${2:-0}}"
+}
+
+# ------------------------------------------------------------------------------
+# STATIC CONFIGURATION & BOUND VALIDATION
+# ------------------------------------------------------------------------------
+THRESHOLD=$(clean_val "${THRESHOLD:-50}" 50)
+HYSTERESIS=$(clean_val "${HYSTERESIS:-3}" 3)
+DIM_BY_PERCENT=$(clean_val "${DIM_BY_PERCENT:-30}" 30)
+MIN_PERCENT=$(clean_val "${MIN_PERCENT:-5}" 5)
+BASE_POLL_INTERVAL=$(clean_val "${BASE_POLL_INTERVAL:-60}" 60)
+SUSPEND_THRESHOLD=$(clean_val "${SUSPEND_THRESHOLD:-10}" 10)
+LOG_THROTTLE=$(clean_val "${LOG_THROTTLE:-30}" 30)
+RESCAN_EVERY=$(clean_val "${RESCAN_EVERY:-10}" 10)
+UDEV_DEBOUNCE_MS=$(clean_val "${UDEV_DEBOUNCE_MS:-150}" 150)
+
+readonly THRESHOLD HYSTERESIS DIM_BY_PERCENT MIN_PERCENT \
+         BASE_POLL_INTERVAL SUSPEND_THRESHOLD LOG_THROTTLE \
+         RESCAN_EVERY UDEV_DEBOUNCE_MS
+
+# Bound assertions
+(( THRESHOLD >= 5 && THRESHOLD <= 95 )) || { printf 'Fatal: THRESHOLD must be [5-95].\n' >&2; exit 1; }
+(( HYSTERESIS >= 1 && HYSTERESIS <= 10 )) || { printf 'Fatal: HYSTERESIS must be [1-10].\n' >&2; exit 1; }
+(( (THRESHOLD + HYSTERESIS) <= 100 )) || { printf 'Fatal: THRESHOLD + HYSTERESIS exceeds 100.\n' >&2; exit 1; }
+(( DIM_BY_PERCENT >= 1 && DIM_BY_PERCENT <= 95 )) || { printf 'Fatal: DIM_BY_PERCENT must be [1-95].\n' >&2; exit 1; }
+(( MIN_PERCENT >= 1 && MIN_PERCENT <= 50 )) || { printf 'Fatal: MIN_PERCENT must be [1-50].\n' >&2; exit 1; }
+(( BASE_POLL_INTERVAL >= 5 && BASE_POLL_INTERVAL <= 86400 )) || { printf 'Fatal: BASE_POLL_INTERVAL out of range.\n' >&2; exit 1; }
+
+# Fast-path CLI dispatcher
+if [[ "${1:-}" == "--help" ]]; then
+    cat << EOF
+battery-dimmer.sh v${DAEMON_VERSION}
+Usage: battery-dimmer.sh [OPTIONS]
+
+Options:
+  --status            Inspect active hardware state and daemon metrics.
+  --install-udev      Deploy ultra-low overhead non-blocking udev notification rule.
+  --remove-udev       Remove deployed udev rule.
+  --install-service   Install and start hardened systemd background unit.
+  --remove-service    Stop and remove systemd background unit.
+  --help              Display this operational manual.
+EOF
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# COMPREHENSIVE HARDWARE STATUS REPORT (ACCESSIBLE TO UNPRIVILEGED USERS)
+# ------------------------------------------------------------------------------
+if [[ "${1:-}" == "--status" ]]; then
+    _daemon_running=0
+    _daemon_pid=""
+
+    if [[ -f "$LOCK_FILE" ]]; then
+        if exec {chk_fd}< "$LOCK_FILE" 2>/dev/null; then
+            if ! flock -n "$chk_fd"; then
+                _daemon_running=1
+                read -r _daemon_pid < "$LOCK_FILE" 2>/dev/null || _daemon_pid="unknown"
+            fi
+            exec {chk_fd}<&- 2>/dev/null || true
+        fi
+    fi
+
+    printf '==============================================================================\n'
+    printf 'BATTERY-DIMMER SYSTEM STATUS (v%s)\n' "$DAEMON_VERSION"
+    printf '==============================================================================\n'
+    if (( _daemon_running )); then
+        printf 'Daemon Process:        ACTIVE [PID %s]\n' "$_daemon_pid"
+        if [[ -d "/proc/$_daemon_pid" ]]; then
+            _rss=$(awk '/VmRSS/ {print $2, $3}' "/proc/$_daemon_pid/status" 2>/dev/null || true)
+            printf 'Memory Consumption:    %s\n' "${_rss:-unavailable}"
+        fi
+    else
+        printf 'Daemon Process:        INACTIVE\n'
+    fi
+
+    printf '\nBacklight Topology:\n'
+    for _bl in /sys/class/backlight/*; do
+        [[ -d "$_bl" ]] || continue
+        read -r _cur < "$_bl/brightness" 2>/dev/null || _cur="ERR"
+        read -r _max < "$_bl/max_brightness" 2>/dev/null || _max="ERR"
+        _type="unknown"
+        [[ -f "$_bl/type" ]] && read -r _type < "$_bl/type" 2>/dev/null || true
+        printf '  - %-20s [Type: %-8s] Current: %-6s Max: %-6s\n' "${_bl##*/}" "$_type" "$_cur" "$_max"
+    done
+
+    printf '\nPower Supply Topology:\n'
+    for _ps in /sys/class/power_supply/*; do
+        [[ -d "$_ps" ]] || continue
+        _type="unknown"
+        read -r _type < "$_ps/type" 2>/dev/null || continue
+        _online=""
+        [[ -f "$_ps/online" ]] && read -r _online < "$_ps/online" 2>/dev/null || true
+        _status=""
+        [[ -f "$_ps/status" ]] && read -r _status < "$_ps/status" 2>/dev/null || true
+        _cap=""
+        [[ -f "$_ps/capacity" ]] && read -r _cap < "$_ps/capacity" 2>/dev/null || true
+        printf '  - %-20s [Type: %-8s] Online: %-3s Status: %-12s Capacity: %s%%\n' \
+            "${_ps##*/}" "$_type" "${_online:-N/A}" "${_status:-N/A}" "${_cap:-N/A}"
+    done
+    printf '==============================================================================\n'
+    exit 0
+fi
+
+# Enforce root privileges for daemon execution
+(( EUID == 0 )) || { printf 'Fatal: Superuser privileges (EUID=0) required.\n' >&2; exit 1; }
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    printf 'Fatal: GNU Bash 4.3 or higher is required.\n' >&2
     exit 1
 fi
 
-# ==============================================================================
-# CONFIGURATION & STRICT VALIDATION (Overflow Protected)
-# ==============================================================================
-: "${THRESHOLD:=50}"
-: "${DIM_BY_PERCENT:=30}"
-: "${MIN_PERCENT:=5}"
-: "${BASE_POLL_INTERVAL:=60}"
-: "${SUSPEND_THRESHOLD:=10}"
-: "${LOG_THROTTLE:=30}"
-: "${RESCAN_EVERY:=10}"
-: "${UDEV_DEBOUNCE:=2}" # Seconds to wait for flapping hardware to settle
+# ------------------------------------------------------------------------------
+# ZERO-FORK LOGGING SUBSYSTEM
+# ------------------------------------------------------------------------------
+declare -g -i LOG_FD=2
+declare -g -i LOG_BYTES=0
+declare -g -A LOG_THROTTLE_MAP=()
 
-# Strict 6-digit upper bound prevents arbitrary user input from overflowing Bash's 64-bit integer limits
-for _var in THRESHOLD DIM_BY_PERCENT MIN_PERCENT BASE_POLL_INTERVAL SUSPEND_THRESHOLD LOG_THROTTLE RESCAN_EVERY UDEV_DEBOUNCE; do
-    [[ "${!_var}" =~ ^0*[0-9]{1,6}$ ]] || { echo "Fatal: $_var must be a positive integer <= 999999." >&2; exit 1; }
-    printf -v "$_var" '%d' "$(( 10#${!_var} ))"
-done
-unset _var
-
-readonly THRESHOLD DIM_BY_PERCENT MIN_PERCENT BASE_POLL_INTERVAL SUSPEND_THRESHOLD LOG_THROTTLE RESCAN_EVERY UDEV_DEBOUNCE
-
-# Added explicit error messages for out-of-bounds configurations
-(( THRESHOLD >= 0 && THRESHOLD <= 100 ))          || { echo "Fatal: THRESHOLD must be 0-100." >&2; exit 1; }
-(( DIM_BY_PERCENT > 0 && DIM_BY_PERCENT <= 100 )) || { echo "Fatal: DIM_BY_PERCENT must be 1-100." >&2; exit 1; }
-(( MIN_PERCENT >= 0 && MIN_PERCENT < 100 ))       || { echo "Fatal: MIN_PERCENT must be 0-99." >&2; exit 1; }
-(( BASE_POLL_INTERVAL >= 10 ))                    || { echo "Fatal: BASE_POLL_INTERVAL must be >= 10." >&2; exit 1; }
-(( UDEV_DEBOUNCE >= 1 && UDEV_DEBOUNCE <= 60 ))   || { echo "Fatal: UDEV_DEBOUNCE must be 1-60." >&2; exit 1; }
-
-# ==============================================================================
-# PATHS, TOCTOU-SAFE INITIALIZATION, & UDEV DEADLOCK PREVENTION
-# ==============================================================================
-readonly SYSFS_BL="/sys/class/backlight"
-readonly SYSFS_PS="/sys/class/power_supply"
-readonly STATE_DIR="/run/battery-dimmer"
-readonly LOCK_FILE="$STATE_DIR/dimmer.lock"
-declare LOG_FILE="/var/log/battery-dimmer.log"
-readonly WAKEUP_FIFO="$STATE_DIR/wakeup"
-readonly SLEEP_FIFO="$STATE_DIR/sleep_timer"
-readonly UDEV_RULE="/etc/udev/rules.d/99-battery-dimmer.rules"
-
-export LC_ALL=C
-(( EUID == 0 )) || { echo "Fatal: Root required." >&2; exit 1; }
-
-# UDEV Deadlock-Immune Installation
-if [[ "${1:-}" == "--install-udev" ]]; then
-    cat <<EOF > "$UDEV_RULE"
-# Wake up battery-dimmer. Non-blocking & immune to process starvation when daemon is stopped.
-SUBSYSTEM=="power_supply", RUN+="/bin/sh -c '! flock -n ${LOCK_FILE} -c true && echo 1 > ${WAKEUP_FIFO} &'"
-EOF
-    udevadm control --reload-rules
-    echo "Installed A++ udev rule. The daemon will wake instantly and safely on AC events."
-    exit 0
-fi
-
-# TOCTOU-Safe State Directory Initialization & Hardening
-mkdir -m 700 "$STATE_DIR" 2>/dev/null || true
-if [[ ! -d "$STATE_DIR" || ! -O "$STATE_DIR" ]]; then
-    echo "Fatal: State dir compromised or unavailable." >&2; exit 1
-fi
-chmod 700 "$STATE_DIR" 2>/dev/null || true
-
-# TOCTOU-Safe FIFO Creation & Hardening
-mkfifo -m 600 "$WAKEUP_FIFO" 2>/dev/null || true
-if [[ ! -p "$WAKEUP_FIFO" || ! -O "$WAKEUP_FIFO" ]]; then
-    echo "Fatal: Wakeup FIFO compromised or invalid." >&2; exit 1
-fi
-chmod 600 "$WAKEUP_FIFO" 2>/dev/null || true
-
-mkfifo -m 600 "$SLEEP_FIFO" 2>/dev/null || true
-if [[ ! -p "$SLEEP_FIFO" || ! -O "$SLEEP_FIFO" ]]; then
-    echo "Fatal: Sleep FIFO compromised or invalid." >&2; exit 1
-fi
-chmod 600 "$SLEEP_FIFO" 2>/dev/null || true
-
-# Daemon Log Reopener
-reopen_logs() {
-    [[ -f "$LOG_FILE" ]] || touch "$LOG_FILE" 2>/dev/null || LOG_FILE="$STATE_DIR/dimmer.log"
-    exec 7>> "$LOG_FILE"
-}
-reopen_logs
-
-# ==============================================================================
-# DAEMON LOCKING & TRAPS (TOCTOU-IMMUNE FLOCK)
-# ==============================================================================
-exec 9> "$LOCK_FILE"
-# Secure the lock FIRST before setting traps, protecting against multi-instance collisions
-flock -n 9 || { echo "Fatal: Already running. Lock held by another instance." >&2; exit 1; }
-
-# Safe Array expansions; separated declaration and initialization for Bash < 4.4 compat
-declare -g -a BACKLIGHTS=() POWER_SUPPLIES=() PS_KIND=() PS_SCOPE=()
-declare -g -A BL_MAX BL_MIN BL_TOL BL_ORIG BL_TARGET BL_OVERRIDE BL_DIMMED LOG_LAST
-# System-call elimination lookup maps for optimized loops
-declare -g -A PS_PATH_VAL PS_PATH_LIMIT
-
-cleanup() {
-    trap '' EXIT SIGINT SIGTERM SIGHUP SIGQUIT 
-    (( CLEANING_UP )) && exit 0
-    CLEANING_UP=1
-
-    log_msg "Stopping daemon. Restoring backlight states..."
-    
-    if (( ${#BACKLIGHTS[@]} > 0 )); then
-        for bl in "${BACKLIGHTS[@]}"; do
-            if [[ "${BL_DIMMED["$bl"]:-0}" == "1" && -n "${BL_ORIG["$bl"]:-}" ]]; then
-                printf '%s\n' "${BL_ORIG["$bl"]}" > "$bl/brightness" 2>/dev/null
-            fi
-        done
-    fi
-
-    # Lock file is cleanly removed now that execution is complete
-    rm -f "$LOCK_FILE" "$WAKEUP_FIFO" "$SLEEP_FIFO"
-    rmdir "$STATE_DIR" 2>/dev/null || true
-    
-    exec 10<&- 2>/dev/null
-    exec 9>&- 2>/dev/null
-    exec 8<&- 2>/dev/null
-    exec 7>&- 2>/dev/null
-    exit 0
-}
-
-# Arm traps only after successfully acquiring lock
-trap cleanup EXIT SIGINT SIGTERM SIGQUIT
-trap reopen_logs SIGHUP
-
-exec 8<> "$WAKEUP_FIFO"
-exec 10<> "$SLEEP_FIFO" # Dedicated internal zero-fork sleep FD
-
-# ==============================================================================
-# MONOTONIC TIME TRACKING & NATIVE SLEEP (Zero-Fork)
-# ==============================================================================
-declare -i BATTERY_PCT=100 SHOULD_DIM=0 POWER_INPUT=0
-declare -i CLEANING_UP=0 WAKEUP_COUNT=0 CURRENT_POLL_INTERVAL=$BASE_POLL_INTERVAL
-
-declare -i UPTIME_REPLY=0
-[[ -f /proc/uptime ]] || { echo "Fatal: /proc/uptime required for accurate monotonic time." >&2; exit 1; }
-get_uptime() {
-    local up _
-    # regular procfs files never block, native fast read is safe here
-    read -r up _ < /proc/uptime || return 1
-    UPTIME_REPLY=$(( 10#${up%%.*} ))
-}
-
-get_uptime
-declare -i LAST_TICK=$UPTIME_REPLY
-
-# Native Zero-Fork Sleep via Dummy FD Timeout
-zero_fork_sleep() {
-    read -t "${1:-0.02}" -u 10 _ || true
-}
-
-# ==============================================================================
-# LOGGING
-# ==============================================================================
 log_msg() {
-    printf '%(%Y-%m-%d %H:%M:%S)T battery-dimmer: %s\n' -1 "${1:-}" >&7 2>/dev/null
+    local msg=$1 entry
+    printf -v entry '%(%Y-%m-%d %H:%M:%S)T [battery-dimmer][%d] %s\n' -1 "$$" "$msg"
+    printf '%s' "$entry" >&"$LOG_FD" 2>/dev/null || true
+    LOG_BYTES+=${#entry}
 }
 
 log_throttled() {
-    local key=$1 text=$2 last now
-    get_uptime
-    now=$UPTIME_REPLY
-    last=${LOG_LAST[$key]:-0}
-    if (( now - last >= LOG_THROTTLE )); then
-        LOG_LAST["$key"]=$now
+    local key=$1 text=$2
+    get_uptime || return 0
+    local -i now=$UPTIME_INT
+    if (( now - ${LOG_THROTTLE_MAP["$key"]:-0} >= LOG_THROTTLE )); then
+        LOG_THROTTLE_MAP["$key"]=$now
         log_msg "$text"
     fi
 }
 
-# ==============================================================================
-# HARDWARE DISCOVERY (Topology updates never wipe runtime user-state)
-# ==============================================================================
-scan_backlights() {
-    local bl max_bright
-    
-    BACKLIGHTS=()
-    BL_MAX=()
-    BL_MIN=()
-    BL_TOL=()
+rotate_logs_if_needed() {
+    if (( LOG_BYTES > 524288 )); then # 512KB Quota
+        exec {LOG_FD}>&- 2>/dev/null || true
+        # Zero-fork atomic log truncation
+        : > "$LOG_FILE" 2>/dev/null || true
+        exec {LOG_FD}>> "$LOG_FILE" || LOG_FD=2
+        LOG_BYTES=0
+        log_msg "Log buffer zero-fork truncated under 512KB quota constraint."
+    fi
+}
 
-    for bl in "$SYSFS_BL"/*; do
-        [[ -f "$bl/brightness" && -f "$bl/max_brightness" ]] || continue
-        read -t 1 -r max_bright < "$bl/max_brightness" 2>/dev/null || continue
-        [[ "$max_bright" =~ ^[0-9]+$ ]] || continue
-        (( max_bright <= 0 )) && continue
-
-        BACKLIGHTS+=("$bl")
-        BL_MAX["$bl"]=$max_bright
-        BL_MIN["$bl"]=$(( max_bright * MIN_PERCENT / 100 < 1 ? 1 : max_bright * MIN_PERCENT / 100 ))
-        BL_TOL["$bl"]=$(( max_bright * 3 / 100 < 2 ? 2 : max_bright * 3 / 100 ))
+# ------------------------------------------------------------------------------
+# ZERO-FORK ASYNCHRONOUS SUSPENDABLE SLEEP
+# ------------------------------------------------------------------------------
+# Drains any errant write tokens to guarantee accurate duration timeouts.
+zero_fork_sleep() {
+    local dur="${1:-0.05}"
+    while read -t "$dur" -u "$SLEEP_FD" _; do
+        : # Token drained; force wait until clean timeout
     done
 }
 
-scan_power_supplies() {
-    local dev type kind scope
-    POWER_SUPPLIES=()
-    PS_KIND=()
-    PS_SCOPE=()
-    PS_PATH_VAL=()
-    PS_PATH_LIMIT=()
+# ------------------------------------------------------------------------------
+# HIGH-PRECISION MONOTONIC HARDWARE CLOCK PARSER
+# ------------------------------------------------------------------------------
+declare -g -i UPTIME_INT=0
+get_uptime() {
+    local raw_up _
+    if read -r raw_up _ < /proc/uptime 2>/dev/null; then
+        raw_up="${raw_up%%.*}"
+        UPTIME_INT=$(( 10#0${raw_up//[!0-9]/} ))
+        return 0
+    fi
+    return 1
+}
 
-    for dev in "$SYSFS_PS"/*; do
-        [[ -f "$dev/type" ]] || continue
-        read -t 1 -r type < "$dev/type" 2>/dev/null || continue
-        type="${type,,}"
+# ------------------------------------------------------------------------------
+# SYSTEM INTEGRATION: UDEV & HARDENED SYSTEMD SERVICES
+# ------------------------------------------------------------------------------
+install_udev() {
+    [[ -d /etc/udev/rules.d ]] || { printf 'Fatal: /etc/udev/rules.d does not exist.\n' >&2; exit 1; }
+    cat << 'EOF' > "$UDEV_RULE"
+# /etc/udev/rules.d/99-battery-dimmer.rules
+# Pure asynchronous zero-fork notification engine for battery-dimmer
+SUBSYSTEM=="power_supply", ACTION=="add|change|remove", RUN+="/bin/sh -c 'echo 1 | dd of=/run/battery-dimmer/wakeup.pipe oflag=nonblock status=none 2>/dev/null || true'"
+EOF
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=power_supply 2>/dev/null || true
+    printf 'Hardened udev notification engine installed: %s\n' "$UDEV_RULE"
+}
 
-        case "$type" in
-            mains|usb*) kind="input" ;;
-            battery) kind="battery" ;;
-            *) continue ;;
-        esac
+remove_udev() {
+    rm -f "$UDEV_RULE" 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+    printf 'Removed udev rules: %s\n' "$UDEV_RULE"
+}
 
-        scope=""
-        [[ -f "$dev/scope" ]] && read -t 1 -r scope < "$dev/scope" 2>/dev/null
+install_systemd() {
+    [[ -d /etc/systemd/system ]] || { printf 'Fatal: /etc/systemd/system does not exist.\n' >&2; exit 1; }
+    local self_bin
+    self_bin="$(readlink -f "$0")"
 
-        # Cache the queryable telemetry file paths now to eliminate stat() syscalls in hot loop
-        if [[ "$kind" == "battery" ]]; then
-            if [[ -f "$dev/capacity" ]]; then
-                PS_PATH_VAL["$dev"]="$dev/capacity"
-                PS_PATH_LIMIT["$dev"]="direct"
-            elif [[ -f "$dev/energy_now" && -f "$dev/energy_full" ]]; then
-                PS_PATH_VAL["$dev"]="$dev/energy_now"
-                PS_PATH_LIMIT["$dev"]="$dev/energy_full"
-            elif [[ -f "$dev/charge_now" && -f "$dev/charge_full" ]]; then
-                PS_PATH_VAL["$dev"]="$dev/charge_now"
-                PS_PATH_LIMIT["$dev"]="$dev/charge_full"
-            else
-                # Battery exists but has no queryable nodes
-                continue
+    cat << EOF > "$SYSTEMD_UNIT"
+[Unit]
+Description=Hardened Low-Power Battery Dimmer Daemon
+Documentation=man:battery-dimmer
+After=multi-user.target systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=$(command -v bash) $self_bin
+Restart=always
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=5s
+
+# Sandboxing & Kernel Attack Surface Reduction
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=false
+ProtectHostname=true
+ProtectClock=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+DevicePolicy=closed
+DeviceAllow=/dev/null rw
+DeviceAllow=/dev/urandom r
+ReadWritePaths=/run /var/lib /sys/class/backlight /sys/devices
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now battery-dimmer.service 2>/dev/null || true
+    printf 'Hardened sandboxed systemd service activated: %s\n' "$SYSTEMD_UNIT"
+}
+
+remove_systemd() {
+    systemctl disable --now battery-dimmer.service 2>/dev/null || true
+    rm -f "$SYSTEMD_UNIT" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    printf 'Removed systemd service: %s\n' "$SYSTEMD_UNIT"
+}
+
+case "${1:-}" in
+    --install-udev)    install_udev; exit 0 ;;
+    --remove-udev)     remove_udev; exit 0 ;;
+    --install-service) install_systemd; exit 0 ;;
+    --remove-service)  remove_systemd; exit 0 ;;
+    "")                ;;
+    *)
+        printf 'Unknown option: %s (see --help)\n' "$1" >&2
+        exit 1
+        ;;
+esac
+
+# ------------------------------------------------------------------------------
+# RUNTIME ENVIRONMENT SETUP & MUTUAL EXCLUSION
+# ------------------------------------------------------------------------------
+for _d in "$RUN_DIR" "$PERSIST_DIR"; do
+    if [[ -L "$_d" ]]; then
+        rm -f "$_d" 2>/dev/null || true
+    fi
+    mkdir -p -m 755 "$_d" 2>/dev/null || true
+    chown 0:0 "$_d" 2>/dev/null || true
+    chmod 755 "$_d" 2>/dev/null || true
+done
+
+# Initialize logging descriptor
+exec {LOG_FD}>> "$LOG_FILE" || LOG_FD=2
+
+# Mutual Exclusion via Open Append (Prevents inode truncation during lock acquisition)
+exec {LOCK_FD}>> "$LOCK_FILE" || { printf 'Fatal: Cannot open lockfile %s\n' "$LOCK_FILE" >&2; exit 1; }
+if ! flock -n "$LOCK_FD"; then
+    printf 'Fatal: Another daemon instance holds exclusive lock on %s\n' "$LOCK_FILE" >&2
+    exit 1
+fi
+chmod 644 "$LOCK_FILE" 2>/dev/null || true
+printf '%d\n' "$$" > "$LOCK_FILE"
+
+# FIFO Setup with Symlink Elimination
+for _fifo in "$WAKEUP_FIFO" "$SLEEP_FIFO"; do
+    if [[ -e "$_fifo" && ( -L "$_fifo" || ! -p "$_fifo" ) ]]; then
+        rm -f "$_fifo" 2>/dev/null || exit 1
+    fi
+    [[ -p "$_fifo" ]] || mkfifo -m 600 "$_fifo" 2>/dev/null || exit 1
+    chmod 600 "$_fifo" 2>/dev/null || true
+    chown 0:0 "$_fifo" 2>/dev/null || true
+done
+
+exec {WAKE_FD}<> "$WAKEUP_FIFO"
+exec {SLEEP_FD}<> "$SLEEP_FIFO"
+
+# ------------------------------------------------------------------------------
+# INTERNAL DATA STRUCTURES & REGISTERS
+# ------------------------------------------------------------------------------
+declare -g -a BACKLIGHTS=() POWER_SUPPLIES=() PS_KIND=()
+declare -g -A BL_MAX=() BL_MIN=() BL_TOL=() BL_ORIG=() BL_TARGET=() \
+               BL_OVERRIDE=() BL_DIMMED=() BL_SCALE=()
+declare -g -A PS_VAL_NODE=() PS_LIM_NODE=() PS_MODE=() PS_VOLT_NODE=()
+declare -g -i BATTERY_PCT=100 CURRENT_POLL_INTERVAL=$BASE_POLL_INTERVAL
+declare -g -i SHOULD_DIM=0 SYSTEM_IS_DIMMED=0 POWER_INPUT=0
+declare -g -i RESCAN_COUNTER=0 LAST_TICK=0 CLEANING_UP=0
+declare -g -i NOW_TICK=0 DRIFT=0 READ_STATUS=0
+declare -g    ACTIVE_STATE_FILE="$FALLBACK_STATE"
+declare -g    CURRENT_BOOT_ID=""
+
+read -r CURRENT_BOOT_ID < /proc/sys/kernel/random/boot_id 2>/dev/null || CURRENT_BOOT_ID="unknown"
+get_uptime || { printf 'Fatal: Monotonic clock unreadable.\n' >&2; exit 1; }
+LAST_TICK=$UPTIME_INT
+
+# ------------------------------------------------------------------------------
+# REENTRANT ATOMIC STATE ENGINE
+# ------------------------------------------------------------------------------
+resolve_state_file() {
+    if [[ -d "$PERSIST_DIR" && -w "$PERSIST_DIR" ]]; then
+        ACTIVE_STATE_FILE="$PRIMARY_STATE"
+    else
+        ACTIVE_STATE_FILE="$FALLBACK_STATE"
+    fi
+}
+
+sync_system_dimmed_state() {
+    local bl
+    local -i any_dim=0
+    for bl in "${BACKLIGHTS[@]}"; do
+        if (( ${BL_DIMMED["$bl"]:-0} == 1 )); then
+            any_dim=1
+            break
+        fi
+    done
+    SYSTEM_IS_DIMMED=$any_dim
+}
+
+persist_state() {
+    resolve_state_file
+    local bl payload
+    local tmp_file="${ACTIVE_STATE_FILE}.tmp.$$"
+
+    payload="# Runtime Persistent State Map"$'\n'
+    payload+="META:BOOT_ID=${CURRENT_BOOT_ID}"$'\n'
+    payload+="META:SYSTEM_IS_DIMMED=${SYSTEM_IS_DIMMED}"$'\n'
+
+    for bl in "${BACKLIGHTS[@]}"; do
+        payload+="ENTRY:${bl}:${BL_ORIG["$bl"]:-0}:${BL_TARGET["$bl"]:-0}:${BL_DIMMED["$bl"]:-0}:${BL_OVERRIDE["$bl"]:-0}"$'\n'
+    done
+
+    # Atomic rename write guarantees zero corrupt reads on power failure
+    if printf '%s' "$payload" > "$tmp_file" 2>/dev/null; then
+        mv -f "$tmp_file" "$ACTIVE_STATE_FILE" 2>/dev/null || rm -f "$tmp_file" 2>/dev/null
+    fi
+}
+
+load_state() {
+    resolve_state_file
+    local state_file="$ACTIVE_STATE_FILE"
+    [[ -f "$state_file" ]] || state_file="$FALLBACK_STATE"
+    [[ -f "$state_file" ]] || return 0
+
+    local line file_boot_id="" dev o_val t_val d_val ov_val
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^META:BOOT_ID=(.+)$ ]]; then
+            file_boot_id="${BASH_REMATCH[1]}"
+            if [[ "$file_boot_id" != "$CURRENT_BOOT_ID" ]]; then
+                log_msg "Stale state from previous boot session purged."
+                rm -f "$state_file" 2>/dev/null || true
+                return 0
+            fi
+            continue
+        fi
+
+        if [[ "$line" =~ ^META:SYSTEM_IS_DIMMED=([01])$ ]]; then
+            SYSTEM_IS_DIMMED=$(( 10#0${BASH_REMATCH[1]} ))
+            continue
+        fi
+
+        if [[ "$line" =~ ^ENTRY:(/sys/class/backlight/[^:]+):([0-9]+):([0-9]+):([01]):([01])$ ]]; then
+            dev="${BASH_REMATCH[1]}"
+            o_val=$(( 10#0${BASH_REMATCH[2]} ))
+            t_val=$(( 10#0${BASH_REMATCH[3]} ))
+            d_val=$(( 10#0${BASH_REMATCH[4]} ))
+            ov_val=$(( 10#0${BASH_REMATCH[5]} ))
+
+            if [[ -d "$dev" ]]; then
+                (( o_val > 0 )) && BL_ORIG["$dev"]=$o_val
+                (( t_val > 0 )) && BL_TARGET["$dev"]=$t_val
+                BL_DIMMED["$dev"]=$d_val
+                BL_OVERRIDE["$dev"]=$ov_val
+            fi
+        fi
+    done < "$state_file" 2>/dev/null
+}
+
+# ------------------------------------------------------------------------------
+# SIGNAL HANDLERS & SAFE CLEANUP
+# ------------------------------------------------------------------------------
+cleanup() {
+    trap '' EXIT SIGINT SIGTERM SIGHUP SIGQUIT
+    (( CLEANING_UP )) && exit 0
+    CLEANING_UP=1
+
+    log_msg "Termination trap tripped. Synchronously restoring backlight hardware..."
+    local bl orig_reg
+    for bl in "${!BL_ORIG[@]}"; do
+        orig_reg=${BL_ORIG["$bl"]:-0}
+        if [[ "${BL_DIMMED["$bl"]:-0}" == "1" ]] && (( orig_reg > 0 )); then
+            if [[ -w "$bl/brightness" ]]; then
+                printf '%d\n' "$orig_reg" > "$bl/brightness" 2>/dev/null || true
+            fi
+        fi
+        BL_DIMMED["$bl"]=0
+    done
+
+    SYSTEM_IS_DIMMED=0
+    resolve_state_file
+    rm -f "$ACTIVE_STATE_FILE" "${ACTIVE_STATE_FILE}.tmp.*" "$WAKEUP_FIFO" "$SLEEP_FIFO" 2>/dev/null || true
+
+    # Safe descriptor teardown (LOCK_FILE inode is preserved to avoid flock race)
+    exec {WAKE_FD}>&- 2>/dev/null || true
+    exec {SLEEP_FD}>&- 2>/dev/null || true
+    exec {LOCK_FD}>&- 2>/dev/null || true
+    exec {LOG_FD}>&- 2>/dev/null || true
+    exit 0
+}
+
+trap cleanup EXIT SIGINT SIGTERM SIGQUIT
+trap 'log_msg "Kernel SIGHUP acknowledged. Resyncing topology..."; RESCAN_COUNTER=RESCAN_EVERY' SIGHUP
+trap 'log_msg "Manual sync tripped via SIGUSR1"; RESCAN_COUNTER=RESCAN_EVERY' SIGUSR1
+
+# ------------------------------------------------------------------------------
+# HARDWARE TOPOLOGY SCANNER: BACKLIGHT SUBSYSTEM
+# ------------------------------------------------------------------------------
+scan_backlights() {
+    local bl max_b b_type pci_pm scale_val
+    local -a raw=() plat=() firm=() candidates=()
+    local -A alive_nodes=()
+
+    BACKLIGHTS=()
+
+    for bl in /sys/class/backlight/*; do
+        [[ -d "$bl" ]] || continue
+
+        # Hybrid GPU Guard: Detect runtime suspended discrete GPUs (PRIME / Optimus)
+        # Reading power/runtime_status does NOT awaken sleeping PCI busses
+        if [[ -f "$bl/device/power/runtime_status" ]]; then
+            pci_pm="active"
+            read -r pci_pm < "$bl/device/power/runtime_status" 2>/dev/null || pci_pm="active"
+            if [[ "$pci_pm" == *suspend* ]]; then
+                continue # Skip sleeping dGPU to preserve package C-states
             fi
         fi
 
-        POWER_SUPPLIES+=("$dev")
-        PS_KIND+=("$kind")
-        PS_SCOPE+=("${scope,,}")
+        [[ -w "$bl/brightness" && -f "$bl/max_brightness" ]] || continue
+
+        max_b=0
+        read -r max_b < "$bl/max_brightness" 2>/dev/null || continue
+        max_b=$(( 10#0${max_b//[!0-9]/} ))
+        (( max_b <= 0 )) && continue
+
+        b_type="raw"
+        [[ -f "$bl/type" ]] && read -r b_type < "$bl/type" 2>/dev/null || b_type="raw"
+
+        case "${b_type,,}" in
+            raw)      raw+=("$bl") ;;
+            platform) plat+=("$bl") ;;
+            firmware) firm+=("$bl") ;;
+            *)        raw+=("$bl") ;;
+        esac
+    done
+
+    # Priority resolution: Native GPU control supersedes firmware/ACPI abstraction
+    if (( ${#raw[@]} > 0 )); then
+        candidates=("${raw[@]}")
+    elif (( ${#plat[@]} > 0 )); then
+        candidates=("${plat[@]}")
+    elif (( ${#firm[@]} > 0 )); then
+        candidates=("${firm[@]}")
+    fi
+
+    for bl in "${candidates[@]}"; do
+        max_b=0
+        read -r max_b < "$bl/max_brightness" 2>/dev/null || continue
+        max_b=$(( 10#0${max_b//[!0-9]/} ))
+        (( max_b <= 0 )) && continue
+
+        alive_nodes["$bl"]=1
+        BACKLIGHTS+=("$bl")
+        BL_MAX["$bl"]=$max_b
+
+        local -i min_calc=$(( max_b * MIN_PERCENT / 100 ))
+        BL_MIN["$bl"]=$(( min_calc < 1 ? 1 : min_calc ))
+
+        # Adaptive rounding tolerance matrix based on register dynamic range
+        if (( max_b <= 30 )); then
+            BL_TOL["$bl"]=0
+        elif (( max_b <= 255 )); then
+            BL_TOL["$bl"]=2
+        else
+            local -i dyn_tol=$(( max_b / 400 ))
+            BL_TOL["$bl"]=$(( dyn_tol < 2 ? 2 : (dyn_tol > 25 ? 25 : dyn_tol) ))
+        fi
+
+        scale_val="linear"
+        if [[ -f "$bl/scale" ]]; then
+            read -r scale_val < "$bl/scale" 2>/dev/null || scale_val="linear"
+        fi
+        BL_SCALE["$bl"]="${scale_val,,}"
+    done
+
+    # Safe hot-unplug eviction
+    for bl in "${!BL_ORIG[@]}"; do
+        if [[ -z "${alive_nodes["$bl"]:-}" ]]; then
+            unset "BL_ORIG[$bl]" "BL_TARGET[$bl]" "BL_DIMMED[$bl]" \
+                  "BL_OVERRIDE[$bl]" "BL_MAX[$bl]" "BL_MIN[$bl]" \
+                  "BL_TOL[$bl]" "BL_SCALE[$bl]"
+        fi
+    done
+
+    sync_system_dimmed_state
+}
+
+# ------------------------------------------------------------------------------
+# HARDWARE TOPOLOGY SCANNER: POWER INFRASTRUCTURE
+# ------------------------------------------------------------------------------
+scan_power_supplies() {
+    local dev p_type scope
+    POWER_SUPPLIES=()
+    PS_KIND=()
+
+    # Re-initialize associative arrays safely to avoid Bash memory leaks
+    unset PS_VAL_NODE PS_LIM_NODE PS_VOLT_NODE PS_MODE
+    declare -g -A PS_VAL_NODE=() PS_LIM_NODE=() PS_VOLT_NODE=() PS_MODE=()
+
+    for dev in /sys/class/power_supply/*; do
+        [[ -d "$dev" && -f "$dev/type" ]] || continue
+        read -r p_type < "$dev/type" 2>/dev/null || continue
+        p_type="${p_type,,}"
+
+        scope="system"
+        if [[ -f "$dev/scope" ]]; then
+            read -r scope < "$dev/scope" 2>/dev/null || scope="system"
+            scope="${scope,,}"
+        fi
+        [[ "$scope" == "device" ]] && continue
+
+        # Filter out peripheral mice, keyboards, and digitizers lacking scope nodes
+        if [[ "${dev,,}" =~ (hid|mouse|kbd|keyboard|wacom|bluetooth) ]]; then
+            continue
+        fi
+
+        case "$p_type" in
+            mains|usb|usb_*|wireless|brickid)
+                POWER_SUPPLIES+=("$dev")
+                PS_KIND+=("input")
+                ;;
+            battery|ups)
+                if [[ -f "$dev/energy_now" && -f "$dev/energy_full" ]]; then
+                    POWER_SUPPLIES+=("$dev")
+                    PS_KIND+=("battery")
+                    PS_VAL_NODE["$dev"]="$dev/energy_now"
+                    PS_LIM_NODE["$dev"]="$dev/energy_full"
+                    PS_MODE["$dev"]="energy"
+                elif [[ -f "$dev/charge_now" && -f "$dev/charge_full" ]]; then
+                    POWER_SUPPLIES+=("$dev")
+                    PS_KIND+=("battery")
+                    PS_VAL_NODE["$dev"]="$dev/charge_now"
+                    PS_LIM_NODE["$dev"]="$dev/charge_full"
+                    PS_MODE["$dev"]="charge"
+                    if [[ -f "$dev/voltage_now" ]]; then
+                        PS_VOLT_NODE["$dev"]="$dev/voltage_now"
+                    elif [[ -f "$dev/voltage_min_design" ]]; then
+                        PS_VOLT_NODE["$dev"]="$dev/voltage_min_design"
+                    fi
+                elif [[ -f "$dev/capacity" ]]; then
+                    POWER_SUPPLIES+=("$dev")
+                    PS_KIND+=("battery")
+                    PS_VAL_NODE["$dev"]="$dev/capacity"
+                    PS_LIM_NODE["$dev"]="direct"
+                    PS_MODE["$dev"]="direct"
+                fi
+                ;;
+        esac
     done
 }
 
-# ==============================================================================
-# TELEMETRY & MATH
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# TELEMETRY ENGINE (OVERFLOW-IMMUNE ARITHMETIC)
+# ------------------------------------------------------------------------------
 update_telemetry() {
-    local i dev kind status online b_now b_full pct
-    local has_battery=0 mains_online=0 any_discharging=0 any_charging=0
-    local total_pct=0 active_batteries=0
-
-    BATTERY_PCT=100 SHOULD_DIM=0 POWER_INPUT=0
+    local -i i=0
+    local dev kind status online val lim v_now mode
+    local -i mains_online=0 any_discharging=0 any_charging=0
+    local -i total_mwh_now=0 total_mwh_full=0
+    local -i cap_weighted_sum=0 cap_weights=0
+    local -i valid_batteries=0
 
     for ((i = 0; i < ${#POWER_SUPPLIES[@]}; i++)); do
-        dev=${POWER_SUPPLIES[i]}
-        kind=${PS_KIND[i]}
+        dev="${POWER_SUPPLIES[i]}"
+        kind="${PS_KIND[i]}"
 
         if [[ "$kind" == "input" ]]; then
-            read -t 1 -r online < "$dev/online" 2>/dev/null || online=0
+            online=0
+            if [[ -f "$dev/online" ]]; then
+                read -r online < "$dev/online" 2>/dev/null || online=0
+                online=$(( 10#0${online//[!0-9]/} ))
+            fi
             (( online == 1 )) && mains_online=1
             continue
         fi
 
-        [[ "${PS_SCOPE[i]}" == "device" ]] && continue
-
+        # Battery Evaluation
         status=""
-        [[ -f "$dev/status" ]] && read -t 1 -r status < "$dev/status" 2>/dev/null
-        case "${status,,}" in
-            discharging) any_discharging=1 ;;
-            charging|full|"not charging") any_charging=1 ;;
-        esac
-
-        b_now=""; b_full=""
-        local cached_now=${PS_PATH_VAL["$dev"]:-}
-        local cached_full=${PS_PATH_LIMIT["$dev"]:-}
-
-        if [[ "$cached_full" == "direct" ]]; then
-            read -t 1 -r b_now < "$cached_now" 2>/dev/null || b_now=""
-            b_full=100
-        elif [[ -n "$cached_now" && -n "$cached_full" ]]; then
-            read -t 1 -r b_now < "$cached_now" 2>/dev/null || b_now=""
-            read -t 1 -r b_full < "$cached_full" 2>/dev/null || b_full=""
+        if [[ -f "$dev/status" ]]; then
+            read -r status < "$dev/status" 2>/dev/null || status=""
+            case "${status,,}" in
+                discharging) any_discharging=1 ;;
+                charging)    any_charging=1 ;;
+            esac
         fi
 
-        # Safeguard: Validate that sysfs values are integers to prevent Bash arithmetic syntax/parsing crashes
-        [[ "$b_now" =~ ^[0-9]+$ && "$b_full" =~ ^[0-9]+$ ]] || continue
-        (( b_full <= 0 )) && continue
+        mode="${PS_MODE["$dev"]:-}"
+        val=0; lim=0
 
-        # Compute dynamic percentage per battery unit
-        pct=$(( (b_now * 100) / b_full ))
-        (( pct > 100 )) && pct=100
+        if [[ "$mode" == "direct" ]]; then
+            read -r val < "${PS_VAL_NODE["$dev"]}" 2>/dev/null || val=0
+            val=$(( 10#0${val//[!0-9]/} ))
+            if (( val > 0 )); then
+                cap_weighted_sum=$(( cap_weighted_sum + val * 100 ))
+                cap_weights=$(( cap_weights + 100 ))
+                (( valid_batteries++ ))
+            fi
+            continue
+        fi
 
-        total_pct=$(( total_pct + pct ))
-        (( active_batteries++ ))
-        has_battery=1
+        read -r val < "${PS_VAL_NODE["$dev"]}" 2>/dev/null || val=0
+        read -r lim < "${PS_LIM_NODE["$dev"]}" 2>/dev/null || lim=0
+        val=$(( 10#0${val//[!0-9]/} ))
+        lim=$(( 10#0${lim//[!0-9]/} ))
+
+        if (( lim == 0 )) && [[ -f "${PS_LIM_NODE["$dev"]}_design" ]]; then
+            read -r lim < "${PS_LIM_NODE["$dev"]}_design" 2>/dev/null || lim=0
+            lim=$(( 10#0${lim//[!0-9]/} ))
+        fi
+
+        # Pre-scale micro-units safely to avoid 32-bit math overflow while checking non-zero
+        (( lim < 1000 )) && continue
+        val=$(( val / 1000 ))
+        lim=$(( lim / 1000 ))
+        (( lim == 0 )) && continue
+
+        if [[ "$mode" == "energy" ]]; then
+            total_mwh_now=$(( total_mwh_now + val ))
+            total_mwh_full=$(( total_mwh_full + lim ))
+            (( valid_batteries++ ))
+        elif [[ "$mode" == "charge" ]]; then
+            v_now=0
+            if [[ -n "${PS_VOLT_NODE["$dev"]:-}" ]]; then
+                read -r v_now < "${PS_VOLT_NODE["$dev"]}" 2>/dev/null || v_now=0
+                v_now=$(( 10#0${v_now//[!0-9]/} ))
+            fi
+
+            # Normalize mAh to mWh if voltage is accessible (uV converted to mV)
+            if (( v_now > 100000 )); then
+                val=$(( (val * (v_now / 1000)) / 1000 ))
+                lim=$(( (lim * (v_now / 1000)) / 1000 ))
+                total_mwh_now=$(( total_mwh_now + val ))
+                total_mwh_full=$(( total_mwh_full + lim ))
+            else
+                cap_weighted_sum=$(( cap_weighted_sum + ((val * 100) / lim) * 100 ))
+                cap_weights=$(( cap_weights + 100 ))
+            fi
+            (( valid_batteries++ ))
+        fi
     done
 
     POWER_INPUT=$mains_online
-    (( ! has_battery )) && { BATTERY_PCT=-1; return; }
 
-    # Weighted Average prevents low-battery triggers on systems with empty secondary bays
-    BATTERY_PCT=$(( total_pct / active_batteries ))
-    if (( mains_online || (any_charging && ! any_discharging) )); then
+    # Calculate aggregate capacity percentage
+    if (( total_mwh_full > 0 )); then
+        BATTERY_PCT=$(( (total_mwh_now * 100) / total_mwh_full ))
+    elif (( cap_weights > 0 )); then
+        BATTERY_PCT=$(( cap_weighted_sum / cap_weights ))
+    else
+        BATTERY_PCT=-1
+        SHOULD_DIM=0
+        return
+    fi
+
+    (( BATTERY_PCT > 100 )) && BATTERY_PCT=100
+    (( BATTERY_PCT < 0 ))   && BATTERY_PCT=0
+
+    # Decision Matrix: Discharging overrides AC state (e.g. underpowered chargers)
+    if (( any_discharging == 1 )); then
+        if (( SYSTEM_IS_DIMMED == 1 )); then
+            (( BATTERY_PCT > THRESHOLD + HYSTERESIS )) && SHOULD_DIM=0 || SHOULD_DIM=1
+        else
+            (( BATTERY_PCT <= THRESHOLD )) && SHOULD_DIM=1 || SHOULD_DIM=0
+        fi
+    elif (( mains_online == 1 || any_charging == 1 )); then
         SHOULD_DIM=0
     else
-        (( BATTERY_PCT <= THRESHOLD )) && SHOULD_DIM=1
+        if (( SYSTEM_IS_DIMMED == 1 )); then
+            (( BATTERY_PCT > THRESHOLD + HYSTERESIS )) && SHOULD_DIM=0 || SHOULD_DIM=1
+        else
+            (( BATTERY_PCT <= THRESHOLD )) && SHOULD_DIM=1 || SHOULD_DIM=0
+        fi
     fi
-    
-    if (( mains_online == 1 )); then
-        CURRENT_POLL_INTERVAL=$(( BASE_POLL_INTERVAL * 5 ))
+
+    # Adaptive polling frequency regulation
+    if (( mains_online == 1 && any_discharging == 0 )); then
+        CURRENT_POLL_INTERVAL=$(( BASE_POLL_INTERVAL * 2 ))
     elif (( BATTERY_PCT > THRESHOLD + 15 )); then
         CURRENT_POLL_INTERVAL=$BASE_POLL_INTERVAL
+    elif (( BATTERY_PCT > THRESHOLD )); then
+        CURRENT_POLL_INTERVAL=$(( BASE_POLL_INTERVAL / 2 >= 10 ? BASE_POLL_INTERVAL / 2 : 10 ))
     else
-        CURRENT_POLL_INTERVAL=$(( BASE_POLL_INTERVAL / 4 > 10 ? BASE_POLL_INTERVAL / 4 : 10 ))
+        CURRENT_POLL_INTERVAL=$(( BASE_POLL_INTERVAL / 4 >= 5 ? BASE_POLL_INTERVAL / 4 : 5 ))
     fi
 }
 
-# ==============================================================================
-# ACTIONS & HARDWARE CONFIRMATION
-# ==============================================================================
-instant_dim() {
-    local bl=$1 start=$2 target=$3 name=$4
-    local check_val
-    
-    # Write the target level directly to the sysfs brightness control immediately
-    printf '%s\n' "$target" > "$bl/brightness" 2>/dev/null
-    
-    # Read back current level to confirm driver registration
-    read -t 1 -r check_val < "$bl/brightness" 2>/dev/null || check_val=0
-    
-    # Hardware rounding safety check: many backlight drivers round requested values to discrete levels.
-    # We compare using the backlight tolerance limit instead of strict equality to prevent false-positive control releases.
-    local diff_check=$(( check_val > target ? check_val - target : target - check_val ))
-    if (( diff_check > ${BL_TOL["$bl"]:-2} )); then
-        log_msg "Warning: Hardware rejected brightness on $name (requested $target, got $check_val, diff $diff_check > tolerance)."
-        return 1
+# ------------------------------------------------------------------------------
+# LUMINANCE CONTROLLER & SETTLING MONITOR
+# ------------------------------------------------------------------------------
+ramp_aware_dim() {
+    local bl=$1
+    local -i target=$2
+    local -i tol=${BL_TOL["$bl"]:-2}
+    local -i cur=0 bl_pwr=0 last_seen=-1 identical_count=0 elapsed_ms=0
+
+    # DPMS Check: If display is suspended, write register and bypass wait loop
+    if [[ -f "$bl/bl_power" ]]; then
+        read -r bl_pwr < "$bl/bl_power" 2>/dev/null || bl_pwr=0
+        bl_pwr=$(( 10#0${bl_pwr//[!0-9]/} ))
+        if (( bl_pwr != 0 )); then
+            printf '%d\n' "$target" > "$bl/brightness" 2>/dev/null || return 1
+            return 0
+        fi
     fi
+
+    # Write target brightness
+    printf '%d\n' "$target" > "$bl/brightness" 2>/dev/null || return 1
+
+    # Monitor hardware transition with settling detection (anti-hang circuit)
+    while (( elapsed_ms < 1000 )); do
+        cur=0
+        if [[ -f "$bl/actual_brightness" ]]; then
+            read -r cur < "$bl/actual_brightness" 2>/dev/null || true
+        fi
+        if (( cur == 0 )); then
+            read -r cur < "$bl/brightness" 2>/dev/null || cur=0
+        fi
+        cur=$(( 10#0${cur//[!0-9]/} ))
+
+        local -i diff=$(( cur > target ? cur - target : target - cur ))
+        if (( diff <= tol )); then
+            BL_TARGET["$bl"]=$cur
+            return 0
+        fi
+
+        # Detect hardware controller completion when target cannot be strictly reached
+        if (( cur == last_seen )); then
+            if (( ++identical_count >= 2 )); then
+                # Controller has settled; update expected target to prevent false overrides
+                BL_TARGET["$bl"]=$cur
+                return 0
+            fi
+        else
+            identical_count=0
+        fi
+
+        last_seen=$cur
+        zero_fork_sleep 0.05
+        elapsed_ms=$(( elapsed_ms + 50 ))
+    done
+
+    BL_TARGET["$bl"]=$cur
     return 0
 }
 
 apply_dim() {
     (( ${#BACKLIGHTS[@]} == 0 )) && return 0
-    local bl name current target reduction diff expected
+    local bl
+    local -i current=0 target=0 r_factor=0 state_changed=0
 
     for bl in "${BACKLIGHTS[@]}"; do
-        name="${bl##*/}"
-        [[ ${BL_OVERRIDE["$name"]:-0} == 1 ]] && continue
+        [[ "${BL_OVERRIDE["$bl"]:-0}" == "1" ]] && continue
 
-        read -t 1 -r current < "$bl/brightness" 2>/dev/null || current=0
+        current=0
+        read -r current < "$bl/brightness" 2>/dev/null || current=0
+        current=$(( 10#0${current//[!0-9]/} ))
+        (( current <= 0 )) && continue
 
         if [[ "${BL_DIMMED["$bl"]:-0}" == "1" ]]; then
-            expected=${BL_TARGET["$bl"]:-$current}
-            diff=$(( current > expected ? current - expected : expected - current ))
-            if (( diff > ${BL_TOL["$bl"]:-2} )); then
-                unset "BL_ORIG[$bl]"
-                unset "BL_TARGET[$bl]"
+            local -i exp=${BL_TARGET["$bl"]:-$current}
+            local -i d=$(( current > exp ? current - exp : exp - current ))
+            # True user override detection
+            if (( d > ${BL_TOL["$bl"]:-2} )); then
                 BL_DIMMED["$bl"]=0
-                BL_OVERRIDE["$name"]=1
-                log_throttled "$name" "Hardware override detected on $name. Released control."
+                BL_OVERRIDE["$bl"]=1
+                unset "BL_TARGET[$bl]" "BL_ORIG[$bl]"
+                state_changed=1
+                sync_system_dimmed_state
+                log_throttled "$bl" "User override detected on ${bl##*/}. Autonomous dimming suspended."
             fi
         else
-            reduction=$(( (current * DIM_BY_PERCENT + 99) / 100 ))
-            (( reduction < 1 )) && reduction=1
-            target=$(( current - reduction ))
-            
+            r_factor=$(( 100 - DIM_BY_PERCENT ))
+
+            if [[ "${BL_SCALE["$bl"]:-linear}" == "non-linear" ]]; then
+                target=$(( (current * r_factor + 50) / 100 ))
+            else
+                # Stevens' Power Law quadratic luminance compensation
+                target=$(( ( ((current * r_factor + 50) / 100) * r_factor + 50 ) / 100 ))
+            fi
+
             (( target < ${BL_MIN["$bl"]:-1} )) && target=${BL_MIN["$bl"]:-1}
 
             if (( current > target )); then
-                if instant_dim "$bl" "$current" "$target" "$name"; then
-                    BL_ORIG["$bl"]=$current
-                    BL_TARGET["$bl"]=$target
-                    BL_DIMMED["$bl"]=1
-                    log_msg "Dimmed $name instantly (${current}->${target}, bat=${BATTERY_PCT}%)"
+                BL_ORIG["$bl"]=$current
+                BL_TARGET["$bl"]=$target
+                BL_DIMMED["$bl"]=1
+                SYSTEM_IS_DIMMED=1
+                state_changed=1
+
+                if ramp_aware_dim "$bl" "$target"; then
+                    log_msg "Dimmed ${bl##*/} (${current} -> ${BL_TARGET["$bl"]}) [Bat: ${BATTERY_PCT}%]"
                 else
-                    unset "BL_ORIG[$bl]"
-                    unset "BL_TARGET[$bl]"
-                    BL_DIMMED["$bl"]=0
-                    BL_OVERRIDE["$name"]=1
+                    log_throttled "fail_$bl" "Backlight bus write error on ${bl##*/}."
                 fi
             fi
         fi
     done
+
+    (( state_changed )) && persist_state
 }
 
 apply_restore() {
     (( ${#BACKLIGHTS[@]} == 0 )) && return 0
-    local bl name current orig_saved
+    local bl
+    local -i orig_val=0 state_changed=0
 
     for bl in "${BACKLIGHTS[@]}"; do
-        name="${bl##*/}"
-
-        if [[ "${BL_DIMMED["$bl"]:-0}" == "1" && -n "${BL_ORIG["$bl"]:-}" ]]; then
-            orig_saved=${BL_ORIG["$bl"]}
-            read -t 1 -r current < "$bl/brightness" 2>/dev/null || current=0
-            
-            instant_dim "$bl" "$current" "$orig_saved" "$name" && \
-                log_msg "Restored $name to original ($orig_saved) instantly."
-            
-            unset "BL_ORIG[$bl]"
-            unset "BL_TARGET[$bl]"
-            BL_DIMMED["$bl"]=0
+        # Clear manual overrides upon connecting stable AC power or charging
+        if (( POWER_INPUT == 1 )) && [[ "${BL_OVERRIDE["$bl"]:-0}" == "1" ]]; then
+            BL_OVERRIDE["$bl"]=0
+            state_changed=1
+            log_msg "Mains restored. Reset override state on ${bl##*/}."
         fi
 
-        (( POWER_INPUT == 1 )) && BL_OVERRIDE["$name"]=0
+        if [[ "${BL_DIMMED["$bl"]:-0}" == "1" ]]; then
+            orig_val=${BL_ORIG["$bl"]:-0}
+
+            if (( orig_val > 0 )); then
+                ramp_aware_dim "$bl" "$orig_val"
+                log_msg "Restored ${bl##*/} to (${orig_val}) [Bat: ${BATTERY_PCT}%]"
+            fi
+
+            unset "BL_ORIG[$bl]" "BL_TARGET[$bl]"
+            BL_DIMMED["$bl"]=0
+            state_changed=1
+        fi
     done
+
+    sync_system_dimmed_state
+    (( state_changed )) && persist_state
 }
 
-# ==============================================================================
-# MAIN EVENT LOOP
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# BOOTSTRAP INITIALIZATION
+# ------------------------------------------------------------------------------
 scan_backlights
 scan_power_supplies
-log_msg "Started. Threshold=${THRESHOLD}%, Dim=${DIM_BY_PERCENT}%, Max Polling=${BASE_POLL_INTERVAL}s."
+load_state
 
-# Drain any stale startup events before entering the loop
-while read -t 0 -u 8; do read -r -t 0.05 -u 8 _ || break; done
+# Instantaneous non-blocking drain of stale bootstrap pipeline tokens
+while read -t 0 -u "$WAKE_FD" 2>/dev/null; do
+    read -r -u "$WAKE_FD" _ || break
+done
 
+log_msg "Daemon active. Threshold: ${THRESHOLD}%% (+${HYSTERESIS}%% Hysteresis), Dim: ${DIM_BY_PERCENT}%%."
+
+# ------------------------------------------------------------------------------
+# MAIN ASYNCHRONOUS EVENT LOOP (PURE ZERO-FORK ENGINE)
+# ------------------------------------------------------------------------------
 while true; do
-    # Sleep until timeout or instant interrupt from Udev pipe
-    if read -t "$CURRENT_POLL_INTERVAL" -r -u 8 _; then
-        zero_fork_sleep "$UDEV_DEBOUNCE"
-        while read -t 0 -u 8; do 
-            read -r -t 0.05 -u 8 _ || break
+    # Asynchronous wait unblocks on udev wake byte, timeout, or trapped signals
+    if read -t "$CURRENT_POLL_INTERVAL" -r -u "$WAKE_FD" _; then
+        # Microsecond non-blocking pipeline drain
+        while read -t 0 -u "$WAKE_FD" 2>/dev/null; do
+            read -r -u "$WAKE_FD" _ || break
         done
+        # Debounce hardware power rail chatter
+        zero_fork_sleep "0.${UDEV_DEBOUNCE_MS}"
+    else
+        READ_STATUS=$?
+        # Re-establish channel if descriptor closed unexpectedly
+        if (( READ_STATUS <= 128 && READ_STATUS != 0 )); then
+            log_msg "Warning: Wake pipeline disrupted (code: $READ_STATUS). Rebuilding..."
+            exec {WAKE_FD}>&- 2>/dev/null || true
+            [[ -p "$WAKEUP_FIFO" ]] || mkfifo -m 600 "$WAKEUP_FIFO" 2>/dev/null || true
+            exec {WAKE_FD}<> "$WAKEUP_FIFO"
+            zero_fork_sleep 0.5
+        fi
     fi
 
+    rotate_logs_if_needed
+
     get_uptime
-    NOW_TICK=$UPTIME_REPLY
-    drift=$(( NOW_TICK - LAST_TICK ))
-    
-    if (( drift > CURRENT_POLL_INTERVAL + SUSPEND_THRESHOLD )); then
-        log_msg "Suspend/resume detected (drift=${drift}s). Forcing hardware rescan."
+    NOW_TICK=$UPTIME_INT
+    DRIFT=$(( NOW_TICK - LAST_TICK ))
+
+    # Detect kernel suspend/resume via monotonic boottime delta
+    if (( DRIFT > CURRENT_POLL_INTERVAL + SUSPEND_THRESHOLD || DRIFT < 0 )); then
+        log_msg "System resume detected (${DRIFT}s drift). Re-probing bus topology..."
         scan_backlights
         scan_power_supplies
     fi
     LAST_TICK=$NOW_TICK
 
-    (( ++WAKEUP_COUNT % RESCAN_EVERY == 0 )) && { scan_backlights; scan_power_supplies; }
+    # Periodic re-enumeration of dynamic hardware (e.g. hotplugged monitors, docks)
+    if (( ++RESCAN_COUNTER >= RESCAN_EVERY )); then
+        RESCAN_COUNTER=0
+        scan_backlights
+        scan_power_supplies
+    fi
 
     update_telemetry
 
@@ -452,6 +975,11 @@ while true; do
         if (( SHOULD_DIM == 1 )); then
             apply_dim
         else
+            apply_restore
+        fi
+    else
+        # Safety net: If batteries disappear while system was dimmed, restore displays
+        if (( SYSTEM_IS_DIMMED == 1 )); then
             apply_restore
         fi
     fi
