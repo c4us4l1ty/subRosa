@@ -12,28 +12,18 @@ This repository contains (PoC) code intended for adversarial emulation, threat h
 
 `Hasche ta mascht centi de (centi de)
 Une voi
-Une tis tesch tufa`
-
-`Hanta mo um paneu (um paneu)
+Une tis tesch tufa` - `Hanta mo um paneu (um paneu)
 Misch ti
-Nan tu me stanka`
-
-`C'est plevin de mika
+Nan tu me stanka` - `C'est plevin de mika
 Tenku-u
-Yve misch ke una um pla`
-
-`Hatzu ma sa mo
+Yve misch ke una um pla` - `Hatzu ma sa mo
 Y ti
 Ah, min han tei
 Ah, cedna y ve
 L’tou
-Mente ni ta`
-
-`Meschne mo um paneu
+Mente ni ta` - `Meschne mo um paneu
 Misch ti
-Nantume sanya`
-
-`Menta mo centi de
+Nantume sanya` - `Menta mo centi de
 Une voi
 Une tis tesch tufa-u
 Uhm
@@ -42,15 +32,11 @@ Mentaa
 Meste fa I
 Ireba, hashi ta-I
 (C'est plevin de mika
-C'est plevin de mika)`
-
-`Es tika valaso
+C'est plevin de mika)` - `Es tika valaso
 Tenku
 Beste ni pleju
 Ha centa yve
 L’amour
-Vehnte mita`
-
-`Hanta mo centi de
+Vehnte mita` - `Hanta mo centi de
 Une voi
 Une tis tesch tufa`
