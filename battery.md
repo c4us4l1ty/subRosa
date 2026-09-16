@@ -149,3 +149,74 @@ In Firefox, navigate to `about:config` and verify:
 * `media.hardware-video-decoding.enabled` is set to `true`.
 
 *Verification:* Open `about:support` in Firefox and check under **Graphics** to confirm `HARDWARE_VIDEO_DECODING` is marked as `default available`.
+
+The 3 black holes eating you right now
+Hole #1: Userspace inferno - 90%+ of a core burned continuously
+opencode: 57.7% CPU, 715MB - this very session, node churn
+firefox: 26.1% + tab 11.1% + tab 9.9% + tab 3.7% = ~50% sustained
+gnome-shell: 8.7% avg, 159 MINUTES CPU in 30h uptime - ABNORMAL
+gnome-shell should be <1-2%. 8.7% + kworker/i915_flip in top means Mutter is compositing nonstop at 1920x1200@60 + 1.25 fractional scale - fractional scaling on Intel UHD costs ~1-2W alone. Combined Firefox RSS ~2GB across 8 contentprocs keeps package C-states from ever going deep. CPUs stuck at ~1500MHz idle, only one core reaches 400MHz.
+Your loadavg 1.04, vmstat us 10-14% sy 3% id 83-91% confirms: never truly idle.
+Hole #2: Sleep that isn't sleep
+mem_sleep: [s2idle] - no S3 deep sleep available
+suspend_stats: success 3 only
+uptime: 1 day 6:24, sleep-inactive-battery-timeout: 900s
+Last suspend: 13:28 -> 13:48 (20 min s2idle)
+idle-delay: 60s
+You basically never suspend. s2idle on Raptor Lake-P drains 3-7W - close the lid overnight = dead by morning. No power-profiles-daemon, you run TLP + thermald instead. TLP defaults are active (PLATFORM_PROFILE_ON_BAT=balanced, ON_SAV=low-power - you are in low-power now, good), but:
+WIFI_PWR_ON_BAT=on should save, yet iwlwifi Unhandled alg: 0x703 spams journal every 2-5 min - firmware bug that wakes the radio
+Bluetooth: Powered: yes, PowerState: on + kworker/hci0 active - ~0.5-1W for nothing
+Idle C-states exposed as POLL / C1_ACPI / C2_ACPI / C3_ACPI only - no deep PC8-PC10 residency visible, so idle floor is ~7W instead of 3-4W achievable
+Display is innocent right now: 3247 / 21333 = 15% brightness. Good.
+Hole #3: 30-hour cruft + firmware age
+BIOS QDCN23WW 01/02/2025 - 20 months old, missing Raptor Lake + AX201 power fixes
+thermald active 35s CPU, btrfs-endio-meta kworkers churning, zram 613MB used, swappiness 60, 1.2GB shared - memory pressure from Firefox+opencode forces compression + IO
+No failed units, no autostart, no flatpak, only background-logo extension - so it's not bloat, it's workload + s2idle.
+Why it feels sudden: at 7.7W you get 4.4h. Open 1 YouTube / Meet / compile and H-chip jumps to 20-30W. 50Wh vanishes. Plus if you "sleep" with s2idle, you lose 15-25% overnight.
+3. Fix it without downloading anything
+No dnf install, only what you have:
+# 1. Kill the BT vampire (instant 0.5-1W)
+bluetoothctl power off
+rfkill block bluetooth
+# re-enable only when needed: rfkill unblock bluetooth; bluetoothctl power on
+
+# 2. Force wifi powersave + check it sticks on battery
+iw dev wlp0s20f3 set power_save on
+iw dev wlp0s20f3 get power_save
+# TLP already wants WIFI_PWR_ON_BAT=on, but verify after unplug:
+cat /sys/module/iwlwifi/parameters/power_save
+
+# 3. Put TLP into true battery savior (edit, no new pkg)
+sudoedit /etc/tlp.d/01-battery.conf
+# paste:
+PLATFORM_PROFILE_ON_BAT=low-power
+CPU_ENERGY_PERF_POLICY_ON_BAT=power
+PCIE_ASPM_ON_BAT=powersupersave
+USB_AUTOSUSPEND=1
+# then:
+sudo tlp start
+
+# 4. Restart the leaking gnome-shell (saves reboot, frees ~200MB + drops 8% -> 1%)
+# press Alt+F2, type r, Enter (Wayland: log out/in instead)
+# or:
+killall -3 gnome-shell
+
+# 5. Contain Firefox - biggest win
+# about:config -> media.ffmpeg.vaapi.enabled=true (Intel UHD decode, -3-5W on video)
+# about:processes -> kill the 640MB/500MB tabs, use auto-suspend addon, limit to <6 tabs on battery
+# gsettings: dim faster
+gsettings set org.gnome.desktop.session idle-delay 60
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 300
+gsettings set org.gnome.settings-daemon.plugins.power idle-dim true
+
+# 6. Stop s2idle overnight death: hibernate or shutdown, don't just close lid
+systemctl suspend  # check drain: cat /sys/class/power_supply/BAT0/energy_now before/after
+# if you lose >5% in 1h s2idle, use:
+systemctl hibernate
+# or shutdown for overnight
+Verify after:
+upower -i /org/freedesktop/UPower/devices/battery_BAT0 | grep -E "energy-rate|percentage|time to empty"
+ps aux --sort=-%cpu | head -n 10
+journalctl -b | grep -c "Unhandled alg: 0x703"
+Target: energy-rate: 4.5-5.5W idle at 15% brightness with BT off + Firefox tamed = 8-9h theoretical, 6h real. If you stay at 7-9W, that's your floor with this H-chip + 1.25 scale + current workload - physics, not a fault.
+If drain in s2idle is still >3W/h after BT off, that's BIOS/firmware - only fix is Lenovo BIOS update + mem_sleep_default=deep if your board ever gets S3, which this one currently doesn't expose.
