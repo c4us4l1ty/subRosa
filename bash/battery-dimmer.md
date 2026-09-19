@@ -80,3 +80,24 @@ sudo systemctl status battery-dimmer.service
 ```
 
 *If fixed, it will output `Active: active (running)`.*
+
+
+
+btw i could've written...
+
+```bash
+
+#!/bin/bash
+
+while true; do
+    battery=$(cat /sys/class/power_supply/BAT0/capacity)
+
+    if [ "$battery" -le 50 ]; then
+        xrandr --output eDP-1 --brightness 0.7
+    else
+        xrandr --output eDP-1 --brightness 1
+    fi
+
+    sleep 30
+done
+```
