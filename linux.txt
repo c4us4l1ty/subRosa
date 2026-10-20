@@ -1,0 +1,13 @@
+{
+  "policies": {
+    "DisablePrivateBrowsing": true,
+    "WebsiteFilter": {
+      "Block": [
+        "https://proxyium.com/*",
+        "http://proxyium.com/*",
+        "https://*.proxyium.com/*",
+        "http://*.proxyium.com/*"
+      ]
+    }
+  }
+}

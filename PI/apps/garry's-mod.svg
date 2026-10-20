@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="64"
+   height="64"
+   version="1.1"
+   id="svg3"
+   sodipodi:docname="garry's-mod.svg"
+   inkscape:version="1.4.2 (ebf0e940d0, 2025-05-08)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview3"
+     pagecolor="#505050"
+     bordercolor="#eeeeee"
+     borderopacity="1"
+     inkscape:showpageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#505050"
+     inkscape:zoom="6.485495"
+     inkscape:cx="32.68833"
+     inkscape:cy="22.665965"
+     inkscape:window-width="2560"
+     inkscape:window-height="1411"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg3" />
+  <defs
+     id="defs2">
+    <pattern
+       xlink:href="#a"
+       id="c"
+       x=".2"
+       y=".2"
+       patternTransform="matrix(10,0,0,10,-1.0986328e-6,-13.001)"
+       preserveAspectRatio="xMidYMid" />
+    <pattern
+       id="a"
+       width="2"
+       height="2"
+       patternTransform="scale(10)"
+       patternUnits="userSpaceOnUse"
+       preserveAspectRatio="xMidYMid"
+       style="fill:#383fb1">
+      <path
+         d="M0 0h1v1H0zm1 1h1v1H1z"
+         style="stroke:none"
+         id="path1" />
+    </pattern>
+    <linearGradient
+       id="b"
+       x1="7.937"
+       x2="7.937"
+       y1="15.081"
+       y2="1.852"
+       gradientTransform="scale(3.7796)"
+       gradientUnits="userSpaceOnUse">
+      <stop
+         offset="0"
+         stop-color="#363636"
+         id="stop1" />
+      <stop
+         offset="1"
+         stop-color="#6c6c6c"
+         id="stop2" />
+    </linearGradient>
+    <filter
+       id="filter1057-9"
+       x="-0.026999999"
+       y="-0.026999999"
+       width="1.054"
+       height="1.054"
+       color-interpolation-filters="sRGB">
+      <feGaussianBlur
+         stdDeviation="0.61875"
+         id="feGaussianBlur1-1" />
+    </filter>
+    <linearGradient
+       id="linearGradient1053-2"
+       x1="-127"
+       x2="-72"
+       y1="60"
+       y2="5"
+       gradientTransform="translate(131.49989,-0.50845967)"
+       gradientUnits="userSpaceOnUse">
+      <stop
+         stop-color="#2e55e7"
+         offset="0"
+         id="stop1-3-7" />
+      <stop
+         stop-color="#0d7eef"
+         offset="1"
+         id="stop2-6-0" />
+    </linearGradient>
+  </defs>
+  <rect
+     x="4.4999995"
+     y="4.4999995"
+     width="55"
+     height="55"
+     ry="15"
+     fill="#141414"
+     filter="url(#filter1057)"
+     opacity="0.3"
+     stroke-linecap="round"
+     stroke-width="2.7444"
+     id="rect3-9"
+     style="filter:url(#filter1057-9)" />
+  <rect
+     x="4.4995003"
+     y="4.4995003"
+     width="55.000999"
+     height="55.000999"
+     ry="15"
+     fill="url(#linearGradient1053)"
+     stroke-linecap="round"
+     stroke-width="2.7444"
+     id="rect4-7"
+     style="fill:url(#linearGradient1053-2)" />
+  <path
+     d="m18.115 42.424 9.288 1.128q.231 1.62 1.07 2.228 1.158.868 3.646.868 3.183 0 4.774-.954 1.07-.637 1.62-2.055.377-1.012.377-3.732v-4.485q-3.646 4.977-9.201 4.977-6.192 0-9.81-5.237-2.835-4.138-2.835-10.301 0-7.725 3.704-11.805 3.732-4.08 9.259-4.08 5.7 0 9.403 5.006V9.67h7.61v27.574q0 5.44-.897 8.13T43.606 49.6t-4.34 2.4q-2.691.868-6.829.868-7.812 0-11.081-2.69-3.27-2.663-3.27-6.771 0-.405.029-.984m7.262-18.026q0 4.89 1.881 7.176 1.91 2.257 4.687 2.257 2.98 0 5.035-2.315 2.054-2.344 2.054-6.915 0-4.774-1.967-7.09-1.968-2.314-4.977-2.314-2.922 0-4.832 2.286-1.88 2.257-1.88 6.915"
+     aria-label="g"
+     style="font-weight:700;font-size:21.3333px;font-family:Arial;-inkscape-font-specification:&quot;Arial Bold&quot;;text-align:end;text-anchor:end;fill:#fff;stroke-width:.833302;stroke-linecap:square"
+     id="path3" />
+</svg>

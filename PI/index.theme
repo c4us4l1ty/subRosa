@@ -1,0 +1,12 @@
+[Icon Theme]
+Name=PI
+Comment=PIY application icons - application icons only, everything else falls back to Adwaita
+Inherits=Adwaita,hicolor
+Directories=apps
+
+[apps]
+Size=64
+Type=Scalable
+MinSize=8
+MaxSize=512
+Context=Applications
