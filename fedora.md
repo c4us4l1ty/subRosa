@@ -29,10 +29,11 @@ sudo mkdir -p /etc/firefox/policies
 sudo nano /etc/firefox/policies/policies.json`
 
 Paste this configuration into the editor:
-`
+```sh
 {
   "policies": {
     "PrivateBrowsingModeAvailability": 1,
+    "BlockAboutProfiles": true,
     "WebsiteFilter": {
       "Block": [
         "*://proxyium.com/*",
@@ -41,7 +42,7 @@ Paste this configuration into the editor:
     }
   }
 }
-`
+```
 
 Step 3: Restart and verify
 
