@@ -24,9 +24,11 @@ If the avatar doesn't disappear or GNOME restores the “V”, restore the backu
 
 **Step 1: Create the Firefox policy file**
 Open a terminal and run:
-`
+```sh
+
 sudo mkdir -p /etc/firefox/policies
 sudo nano /etc/firefox/policies/policies.json`
+```
 
 Paste this configuration into the editor:
 ```sh
