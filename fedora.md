@@ -1,12 +1,14 @@
  **if no printer is used.**
- `sudo dnf remove \
+ ```sh
+  sudo dnf remove \
   cups \
   cups-browsed \
   cups-filters \
   cups-pk-helper \
   gutenprint \
   hplip \
-  system-config-printer-udev`
+  system-config-printer-udev
+```
 
 Open Terminal.
 Run: `sudo nano /var/lib/AccountsService/users/$USER` Look for a line beginning with Icon=. Remove that line, if present. Log out and log back in.
