@@ -12,7 +12,8 @@
 
 Open Terminal.
 Run: `sudo nano /var/lib/AccountsService/users/$USER` Look for a line beginning with Icon=. Remove that line, if present. Log out and log back in.
-Important: This may restore the default avatar or the “V” rather than hide the picture completely. GNOME normally displays a fallback avatar, so removing it entirely may require changing desktop environment code or configuration.
+
+*Important: This may restore the default avatar or the “V” rather than hide the picture completely. GNOME normally displays a fallback avatar, so removing it entirely may require changing desktop environment code or configuration.*
 
 1. Open Terminal and run: `sudo ls -l /var/lib/AccountsService/icons/`
 Look for a file matching your username.
