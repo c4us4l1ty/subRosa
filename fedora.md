@@ -54,5 +54,5 @@ Step 3: Restart and verify
     about:policies
     Open the Active tab.
 
-You should see PrivateBrowsingModeAvailability and WebsiteFilter listed among the active policies.
+You should see `PrivateBrowsingModeAvailability` and `WebsiteFilter` listed among the active policies.
 
